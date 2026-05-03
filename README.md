@@ -1,0 +1,1 @@
+# Genki.B.C-Badminton-pair-manager
