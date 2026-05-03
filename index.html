@@ -379,7 +379,22 @@ if (typeof document !== "undefined" && !document.getElementById("bm-css-v2")) {
 // ═══════════════════════════════════════════════════════════
 // Root
 // ═══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+// App-level passphrase (entry password)
+// ═══════════════════════════════════════════════════════════
+const APP_PASSPHRASE = "げんきばど";
+const APP_PASSPHRASE_KEY = "bm-app-pass-v1";
+
 function App() {
+  // 合言葉認証
+  const [passphraseOk, setPassphraseOk] = useState(() => {
+    try {
+      return localStorage.getItem(APP_PASSPHRASE_KEY) === "ok";
+    } catch (e) {
+      return false;
+    }
+  });
+
   // Firebase から非同期で初期データを取得
   const [d, setD] = useState(blankRoom());
   const [loaded, setLoaded] = useState(false);
@@ -603,6 +618,18 @@ function App() {
     newSession,
     setMode,
   };
+
+  // ① 合言葉ゲート(最優先)
+  if (!passphraseOk) {
+    return (
+      <PassphraseGate
+        onSuccess={() => {
+          try { localStorage.setItem(APP_PASSPHRASE_KEY, "ok"); } catch (e) {}
+          setPassphraseOk(true);
+        }}
+      />
+    );
+  }
 
   if (!loaded) {
     return (
@@ -2801,6 +2828,180 @@ function SessionPanel({ sessionStart, playerCount, historyCount, onNewSession, o
         >
           全データをリセット
         </button>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════
+// PassphraseGate — アプリ起動時の合言葉(全員共通)
+// ═══════════════════════════════════════════════════════════
+function PassphraseGate({ onSuccess }) {
+  const [input, setInput] = useState("");
+  const [error, setError] = useState(false);
+  const [shaking, setShaking] = useState(false);
+
+  function tryUnlock() {
+    if (input.trim() === APP_PASSPHRASE) {
+      onSuccess();
+    } else {
+      setError(true);
+      setShaking(true);
+      setTimeout(() => setShaking(false), 400);
+      setInput("");
+    }
+  }
+
+  return (
+    <div
+      style={{
+        minHeight: "100vh",
+        background: T.bg,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "24px 20px",
+        fontFamily:
+          "'Hiragino Kaku Gothic ProN','Noto Sans JP',sans-serif",
+      }}
+    >
+      <div
+        style={{
+          width: "100%",
+          maxWidth: 360,
+          textAlign: "center",
+        }}
+      >
+        {/* Shuttle decoration */}
+        <div
+          style={{
+            width: 72,
+            height: 72,
+            margin: "0 auto 22px",
+            borderRadius: "50%",
+            background: T.bgDark,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            color: T.accent,
+            boxShadow: "0 8px 24px rgba(15,22,18,.18)",
+          }}
+        >
+          <IconShuttle size={36} />
+        </div>
+
+        <div
+          className="mono"
+          style={{
+            fontSize: 11,
+            letterSpacing: ".22em",
+            color: T.primary,
+            marginBottom: 10,
+            textTransform: "uppercase",
+          }}
+        >
+          Welcome
+        </div>
+        <div
+          style={{
+            fontSize: 24,
+            fontWeight: 900,
+            letterSpacing: "-.02em",
+            marginBottom: 8,
+            color: T.ink,
+          }}
+        >
+          合言葉を入力
+        </div>
+        <div
+          style={{
+            color: T.inkSoft,
+            fontSize: 13,
+            marginBottom: 26,
+            lineHeight: 1.6,
+          }}
+        >
+          このアプリは合言葉を知っている方のみ
+          <br />
+          ご利用いただけます
+        </div>
+
+        <input
+          type="text"
+          autoComplete="off"
+          autoCorrect="off"
+          autoCapitalize="off"
+          spellCheck="false"
+          className={shaking ? "bm-shake-input" : ""}
+          style={{
+            width: "100%",
+            padding: "16px 18px",
+            borderRadius: 14,
+            border: `1.5px solid ${error ? T.danger : T.line}`,
+            background: T.surface,
+            color: T.ink,
+            fontSize: 18,
+            textAlign: "center",
+            marginBottom: error ? 8 : 16,
+            transition: "border-color .15s",
+            fontWeight: 600,
+            letterSpacing: ".05em",
+          }}
+          placeholder="ひらがなで入力"
+          value={input}
+          onChange={(e) => {
+            setInput(e.target.value);
+            setError(false);
+          }}
+          onKeyDown={(e) => e.key === "Enter" && tryUnlock()}
+          autoFocus
+        />
+        {error && (
+          <div
+            style={{
+              color: T.danger,
+              fontSize: 12,
+              marginBottom: 16,
+            }}
+          >
+            合言葉が違います
+          </div>
+        )}
+        <button
+          disabled={!input.trim()}
+          onClick={tryUnlock}
+          style={{
+            width: "100%",
+            padding: "14px",
+            background: !input.trim() ? T.lineSoft : T.primary,
+            border: "none",
+            borderRadius: 12,
+            color: !input.trim() ? T.inkSoft : T.surface,
+            fontSize: 15,
+            fontWeight: 700,
+            cursor: !input.trim() ? "not-allowed" : "pointer",
+            boxShadow: !input.trim()
+              ? "none"
+              : `0 6px 16px rgba(10,135,84,.28)`,
+          }}
+        >
+          入る
+        </button>
+
+        <div
+          style={{
+            marginTop: 30,
+            fontSize: 11,
+            color: T.inkSoft,
+            opacity: 0.6,
+            lineHeight: 1.6,
+          }}
+        >
+          一度入力すると、この端末では
+          <br />
+          次回から自動で開けます
+        </div>
       </div>
     </div>
   );
