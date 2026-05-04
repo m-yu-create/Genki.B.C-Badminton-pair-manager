@@ -7,7 +7,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="default" />
 <meta name="apple-mobile-web-app-title" content="バドミントン" />
 <meta name="theme-color" content="#0a8754" />
-<title>バドミントン対戦管理</title>
+<title>Genki.B.C バドミントン対戦管理</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E🏸%3C/text%3E%3C/svg%3E" />
 
 <!-- React + ReactDOM (production) -->
@@ -15,6 +15,9 @@
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <!-- Babel for JSX transformation in browser -->
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<!-- Firebase SDK (compat 版 = window.firebase でアクセス可能) -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
 
 <style>
   html, body { margin: 0; padding: 0; background: #f5f3ec; }
@@ -46,8 +49,8 @@
 const { useState, useEffect, useRef } = React;
 
 // ═══════════════════════════════════════════════════════════
-// Storage layer — Firebase Realtime Database
-// データは全員で共有されます
+// Storage layer — Firebase Realtime Database (SDK + onValue)
+// 初回1回だけ取得し、以降は変更があった時だけプッシュで受信
 // ═══════════════════════════════════════════════════════════
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyAqh9RzVrUFyTfzCG5H3QeKqDbuI107U-c",
@@ -60,7 +63,22 @@ const FIREBASE_CONFIG = {
 };
 
 const ROOM_PATH = "rooms/main";
-const DB_URL = `${FIREBASE_CONFIG.databaseURL}/${ROOM_PATH}.json`;
+
+// Firebase SDK は CDN(window.firebase)から読み込まれている前提
+// HTML側で <script src="https://www.gstatic.com/firebasejs/.../firebase-app-compat.js">
+//        と <script src="https://www.gstatic.com/firebasejs/.../firebase-database-compat.js"> を読み込む
+let _db = null;
+function getDB() {
+  if (_db) return _db;
+  if (typeof window === "undefined" || !window.firebase) {
+    throw new Error("Firebase SDK が読み込まれていません");
+  }
+  if (!window.firebase.apps || window.firebase.apps.length === 0) {
+    window.firebase.initializeApp(FIREBASE_CONFIG);
+  }
+  _db = window.firebase.database();
+  return _db;
+}
 
 function blankRoom() {
   return {
@@ -78,40 +96,52 @@ function blankRoom() {
   };
 }
 
-// Firebase REST API で読み込み (GET)
-async function loadRoom() {
-  try {
-    const res = await fetch(DB_URL);
-    if (!res.ok) throw new Error("ネットワークエラー");
-    const data = await res.json();
-    if (data && typeof data === "object") {
-      // Firebase は空配列を null として返すので復元
-      const merged = { ...blankRoom(), ...data };
-      merged.players = merged.players || [];
-      merged.matches = merged.matches || [];
-      merged.history = merged.history || [];
-      merged.waiting = merged.waiting || [];
-      merged.lastNewMatchIds = merged.lastNewMatchIds || [];
-      return merged;
-    }
-  } catch (e) {
-    console.error("読み込みエラー:", e);
-  }
-  return blankRoom();
+// Firebase から受け取ったデータを正規化
+function normalizeRoom(data) {
+  if (!data || typeof data !== "object") return blankRoom();
+  const merged = { ...blankRoom(), ...data };
+  merged.players = merged.players || [];
+  merged.matches = merged.matches || [];
+  merged.history = merged.history || [];
+  merged.waiting = merged.waiting || [];
+  merged.lastNewMatchIds = merged.lastNewMatchIds || [];
+  return merged;
 }
 
-// Firebase REST API で保存 (PUT - 全置換)
+// 書き込み (set = 全置換)
 async function saveRoom(data) {
   try {
-    const res = await fetch(DB_URL, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
-    });
-    return res.ok;
+    const db = getDB();
+    await db.ref(ROOM_PATH).set(data);
+    return true;
   } catch (e) {
     console.error("保存に失敗しました:", e);
     return false;
+  }
+}
+
+// リアルタイム購読: コールバックを変更時に呼ぶ。返り値で解除可能
+function subscribeRoom(onChange, onError) {
+  try {
+    const db = getDB();
+    const ref = db.ref(ROOM_PATH);
+    const handler = ref.on(
+      "value",
+      (snapshot) => {
+        const data = snapshot.val();
+        onChange(normalizeRoom(data));
+      },
+      (err) => {
+        console.error("subscribe error:", err);
+        if (onError) onError(err);
+      }
+    );
+    // unsubscribe 関数を返す
+    return () => ref.off("value", handler);
+  } catch (e) {
+    console.error("subscribe init error:", e);
+    if (onError) onError(e);
+    return () => {};
   }
 }
 
@@ -404,50 +434,32 @@ function App() {
   const [myId, setMyId] = useState(null);
   const lastRev = useRef(-1);
 
-  // 初回ロード
+  // Firebase リアルタイム購読: 初回データ取得 + 変更を自動受信
   useEffect(() => {
-    (async () => {
-      const data = await loadRoom();
-      setD(data);
-      lastRev.current = data.rev || 0;
-      setLoaded(true);
-    })();
-  }, []);
-
-  // 4秒ごとに最新データを取得して反映
-  useEffect(() => {
-    if (!loaded) return;
-    const id = setInterval(async () => {
-      try {
-        const res = await fetch(DB_URL);
-        if (!res.ok) {
-          setOnline(false);
-          return;
+    const unsubscribe = subscribeRoom(
+      (remote) => {
+        // 自分が書き込んだばかりの内容(同じrev)もここに来るが、
+        // setD は内容が同じなら再レンダリングしないので問題なし
+        if ((remote.rev || 0) >= lastRev.current) {
+          lastRev.current = remote.rev || 0;
+          setD(remote);
         }
         setOnline(true);
-        const remote = await res.json();
-        if (remote && (remote.rev || 0) > lastRev.current) {
-          lastRev.current = remote.rev || 0;
-          const merged = { ...blankRoom(), ...remote };
-          merged.players = merged.players || [];
-          merged.matches = merged.matches || [];
-          merged.history = merged.history || [];
-          merged.waiting = merged.waiting || [];
-          merged.lastNewMatchIds = merged.lastNewMatchIds || [];
-          setD(merged);
-        }
-      } catch (e) {
+        if (!loaded) setLoaded(true);
+      },
+      () => {
         setOnline(false);
       }
-    }, 4000);
-    return () => clearInterval(id);
-  }, [loaded]);
+    );
+    return unsubscribe;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function upd(fn) {
     const next = fn(d);
     next.rev = (d.rev || 0) + 1;
     lastRev.current = next.rev;
-    setD(next);
+    setD(next); // 楽観的更新: ローカル即時反映
     saveRoom(next).then((ok) => setOnline(ok));
   }
 
