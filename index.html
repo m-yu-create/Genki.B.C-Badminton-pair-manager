@@ -7,7 +7,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="default" />
 <meta name="apple-mobile-web-app-title" content="バドミントン" />
 <meta name="theme-color" content="#0a8754" />
-<title>Genki.B.C バドミントン対戦管理</title>
+<title>バドミントン対戦管理</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E🏸%3C/text%3E%3C/svg%3E" />
 
 <!-- React + ReactDOM (production) -->
@@ -768,16 +768,43 @@ function Home({ ctx }) {
           }}
         />
         <div
-          className="mono"
           style={{
-            fontSize: 11,
-            letterSpacing: ".24em",
-            opacity: 0.55,
-            textTransform: "uppercase",
-            marginBottom: 12,
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 8,
+            marginBottom: 14,
           }}
         >
-          Doubles · Match Manager
+          <span
+            style={{
+              fontFamily: "'Zen Old Mincho', 'Times New Roman', serif",
+              fontSize: 18,
+              fontWeight: 700,
+              letterSpacing: ".03em",
+              color: T.accent,
+              fontStyle: "italic",
+            }}
+          >
+            Genki.B.C
+          </span>
+          <span
+            style={{
+              width: 1,
+              height: 14,
+              background: "rgba(255,255,255,.25)",
+            }}
+          />
+          <span
+            className="mono"
+            style={{
+              fontSize: 10,
+              letterSpacing: ".24em",
+              opacity: 0.55,
+              textTransform: "uppercase",
+            }}
+          >
+            Doubles Manager
+          </span>
         </div>
         <div
           style={{
