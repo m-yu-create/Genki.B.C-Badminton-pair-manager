@@ -97,6 +97,8 @@ function blankRoom() {
     adminPassword: "0712",
     savedSessions: [], // アーカイブされた過去セッション
     attendanceLog: [], // 各セッションの参加履歴(出席頻度用)
+    restingIds: [], // 休憩中のプレイヤーID
+    singlesMode: false, // シングルスモード
   };
 }
 
@@ -111,6 +113,8 @@ function normalizeRoom(data) {
   merged.lastNewMatchIds = merged.lastNewMatchIds || [];
   merged.savedSessions = merged.savedSessions || [];
   merged.attendanceLog = merged.attendanceLog || [];
+  merged.restingIds = merged.restingIds || [];
+  merged.singlesMode = !!merged.singlesMode;
   return merged;
 }
 
@@ -171,16 +175,21 @@ function shuffle(a) {
 // Pairing algorithm — minimizes repeat partners/opponents
 // while balancing match counts
 // ═══════════════════════════════════════════════════════════
-function buildMatches(players, courts, history, currentMatches = []) {
-  if (players.length < 4) return { matches: [], waiting: players };
+function buildMatches(players, courts, history, currentMatches = [], restingIds = [], singlesMode = false) {
+  const playersPerMatch = singlesMode ? 2 : 4;
+  if (players.length < playersPerMatch) return { matches: [], waiting: players };
+
+  // 休憩中のIDをセットに
+  const restingSet = new Set(restingIds);
 
   // Track who is already on court (busy)
   const busyIds = new Set();
   currentMatches.forEach((m) => {
     [...m.team1, ...m.team2].forEach((p) => busyIds.add(p.id));
   });
-  const available = players.filter((p) => !busyIds.has(p.id));
-  if (available.length < 4) return { matches: [], waiting: available };
+  // 休憩中・試合中の人を除外
+  const available = players.filter((p) => !busyIds.has(p.id) && !restingSet.has(p.id));
+  if (available.length < playersPerMatch) return { matches: [], waiting: available };
 
   // Match count per player (across history)
   const playCount = {};
@@ -222,17 +231,52 @@ function buildMatches(players, courts, history, currentMatches = []) {
 
   // Free courts available
   const freeCourts = courts - currentMatches.length;
-  const numMatches = Math.min(Math.floor(available.length / 4), freeCourts);
+  const numMatches = Math.min(Math.floor(available.length / playersPerMatch), freeCourts);
   if (numMatches <= 0) return { matches: [], waiting: available };
 
   // ステップ1: 公平に出場メンバーを決める
-  // play count が少ない人を優先して4*numMatches人を選ぶ
+  // play count が少ない人を優先して playersPerMatch*numMatches 人を選ぶ
   const sortedByPlay = shuffle(available).sort((a, b) => playCount[a.id] - playCount[b.id]);
-  // Tieの境界を検出: 出場枠ぎりぎりの play count に同じ人が複数いる場合、
-  // その中からランダムに選ぶ(完全公平)
-  const playing = sortedByPlay.slice(0, numMatches * 4);
-  const waiting = sortedByPlay.slice(numMatches * 4);
+  const playing = sortedByPlay.slice(0, numMatches * playersPerMatch);
+  const waiting = sortedByPlay.slice(numMatches * playersPerMatch);
 
+  // ===== シングルスモード: 1対1の組み合わせを生成 =====
+  if (singlesMode) {
+    // 対戦カードペア生成: 連続2人ずつ、過去の対戦相手を避けるよう最適化
+    function scoreSinglesPair(p1, p2) {
+      return 10 * (opponent[p1.id]?.[p2.id] || 0);
+    }
+    function buildSinglesOnce(arr) {
+      let total = 0;
+      const built = [];
+      for (let i = 0; i < arr.length; i += 2) {
+        const pair = [arr[i], arr[i + 1]];
+        total += scoreSinglesPair(pair[0], pair[1]);
+        built.push({ team1: [pair[0]], team2: [pair[1]] });
+      }
+      return { built, total };
+    }
+    let bestSinglesPlan = buildSinglesOnce(playing);
+    for (let i = 0; i < 300; i++) {
+      const candidate = shuffle(playing);
+      const result = buildSinglesOnce(candidate);
+      if (result.total < bestSinglesPlan.total) bestSinglesPlan = result;
+    }
+    const usedCourts = new Set(currentMatches.map((m) => m.court));
+    const freeCourtNums = [];
+    for (let i = 1; i <= courts; i++) if (!usedCourts.has(i)) freeCourtNums.push(i);
+    const newMatches = bestSinglesPlan.built.map((b, i) => ({
+      id: gid(),
+      court: freeCourtNums[i],
+      team1: b.team1,
+      team2: b.team2,
+      createdAt: Date.now(),
+      singles: true,
+    }));
+    return { matches: newMatches, waiting };
+  }
+
+  // ===== ダブルスモード(従来通り) =====
   // ステップ2: numMatches試合への割り当てを最適化
   // 4人グループへの分割もペア数を最小化するように決める
   function scoreMatch(t1, t2) {
@@ -342,6 +386,7 @@ function buildMatches(players, courts, history, currentMatches = []) {
     team1: b.team1,
     team2: b.team2,
     createdAt: Date.now(),
+    singles: false,
   }));
 
   return { matches: newMatches, waiting };
@@ -471,6 +516,8 @@ function App() {
   const [toast, setToast] = useState("");
   const [myId, setMyId] = useState(null);
   const lastRev = useRef(-1);
+  const undoStack = useRef([]);
+  const [undoCount, setUndoCount] = useState(0); // 再レンダリング用
 
   // Firebase リアルタイム購読: 初回データ取得 + 変更を自動受信
   useEffect(() => {
@@ -493,12 +540,34 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  function upd(fn) {
+  function upd(fn, opts = {}) {
     const next = fn(d);
     next.rev = (d.rev || 0) + 1;
     lastRev.current = next.rev;
+    // Undo履歴に積む(opts.skipUndo=trueの時だけスキップ)
+    if (!opts.skipUndo) {
+      const snapshot = JSON.parse(JSON.stringify(d));
+      undoStack.current = [...undoStack.current, snapshot].slice(-5); // 最大5件
+      setUndoCount(undoStack.current.length);
+    }
     setD(next); // 楽観的更新: ローカル即時反映
     saveRoom(next).then((ok) => setOnline(ok));
+  }
+
+  // Undo
+  function undo() {
+    if (undoStack.current.length === 0) {
+      showToast("元に戻せる操作がありません");
+      return;
+    }
+    const previous = undoStack.current[undoStack.current.length - 1];
+    undoStack.current = undoStack.current.slice(0, -1);
+    setUndoCount(undoStack.current.length);
+    previous.rev = (d.rev || 0) + 1;
+    lastRev.current = previous.rev;
+    setD(previous);
+    saveRoom(previous).then((ok) => setOnline(ok));
+    showToast(`1つ前の操作に戻しました (残り${undoStack.current.length}回)`);
   }
 
   function showToast(msg) {
@@ -528,16 +597,39 @@ function App() {
     );
 
     if (inMatch && waiting.length > 0) {
-      // 待機中から1人選んで代理に
+      // 待機中から1人選んで代理に(休憩中は除く)
       // 出場回数が一番少ない人を優先
+      const restingSet = new Set(d.restingIds || []);
+      const availableWaiting = waiting.filter((p) => !restingSet.has(p.id));
+      if (availableWaiting.length === 0) {
+        // 待機者は全員休憩中 → 試合無効化(下のelseと同じ処理)
+        upd((p) => ({
+          ...p,
+          players: p.players.filter((x) => x.id !== pid),
+          waiting: p.waiting.filter((x) => x.id !== pid),
+          matches: p.matches
+            .map((m) => ({
+              ...m,
+              team1: m.team1.filter((x) => x.id !== pid),
+              team2: m.team2.filter((x) => x.id !== pid),
+            }))
+            .filter((m) => {
+              const required = m.singles ? 1 : 2;
+              return m.team1.length === required && m.team2.length === required;
+            }),
+        }));
+        if (pid === myId) setMyId(null);
+        showToast("退出 · 試合が中止になりました(代理候補が休憩中)");
+        return;
+      }
       const playCountForWaiting = {};
-      waiting.forEach((p) => (playCountForWaiting[p.id] = 0));
+      availableWaiting.forEach((p) => (playCountForWaiting[p.id] = 0));
       history.forEach((m) =>
         [...m.team1, ...m.team2].forEach((p) => {
           if (playCountForWaiting[p.id] !== undefined) playCountForWaiting[p.id]++;
         })
       );
-      const substitute = [...waiting].sort(
+      const substitute = [...availableWaiting].sort(
         (a, b) => playCountForWaiting[a.id] - playCountForWaiting[b.id]
       )[0];
 
@@ -571,7 +663,10 @@ function App() {
             team1: m.team1.filter((x) => x.id !== pid),
             team2: m.team2.filter((x) => x.id !== pid),
           }))
-          .filter((m) => m.team1.length === 2 && m.team2.length === 2),
+          .filter((m) => {
+              const required = m.singles ? 1 : 2;
+              return m.team1.length === required && m.team2.length === required;
+            }),
       }));
       if (pid === myId) setMyId(null);
       showToast("退出 · 試合が中止になりました(代理なし)");
@@ -589,7 +684,7 @@ function App() {
   }
 
   function startMatches() {
-    const { matches: ms, waiting: ws } = buildMatches(players, d.courts, history, []);
+    const { matches: ms, waiting: ws } = buildMatches(players, d.courts, history, [], d.restingIds || [], d.singlesMode);
     upd((p) => ({
       ...p,
       matches: ms,
@@ -603,7 +698,7 @@ function App() {
   }
 
   function regenMatches() {
-    const { matches: ms, waiting: ws } = buildMatches(players, d.courts, history, []);
+    const { matches: ms, waiting: ws } = buildMatches(players, d.courts, history, [], d.restingIds || [], d.singlesMode);
     upd((p) => ({
       ...p,
       matches: ms,
@@ -632,7 +727,9 @@ function App() {
       updP,
       d.courts,
       newHistory,
-      remaining
+      remaining,
+      d.restingIds || [],
+      d.singlesMode
     );
     const newIds = addMatches.map((x) => x.id);
     upd(() => ({
@@ -649,6 +746,92 @@ function App() {
     } else {
       showToast("結果を記録しました");
     }
+  }
+
+  // 履歴の試合の勝者を変更する
+  function editHistoryWinner(historyId, newWinner) {
+    const target = history.find((h) => h.id === historyId);
+    if (!target || target.winner === newWinner) return;
+
+    const oldWinTeam = target.winner === 1 ? target.team1 : target.team2;
+    const oldLoseTeam = target.winner === 1 ? target.team2 : target.team1;
+    const newWinTeam = newWinner === 1 ? target.team1 : target.team2;
+    const newLoseTeam = newWinner === 1 ? target.team2 : target.team1;
+
+    // 旧勝者から-1, 旧敗者から-1
+    // 新勝者に+1, 新敗者に+1
+    const oldWinIds = new Set(oldWinTeam.map((p) => p.id));
+    const oldLoseIds = new Set(oldLoseTeam.map((p) => p.id));
+    const newWinIds = new Set(newWinTeam.map((p) => p.id));
+    const newLoseIds = new Set(newLoseTeam.map((p) => p.id));
+
+    const updP = players.map((p) => {
+      let wins = p.wins || 0;
+      let losses = p.losses || 0;
+      if (oldWinIds.has(p.id)) wins -= 1;
+      if (oldLoseIds.has(p.id)) losses -= 1;
+      if (newWinIds.has(p.id)) wins += 1;
+      if (newLoseIds.has(p.id)) losses += 1;
+      return { ...p, wins: Math.max(0, wins), losses: Math.max(0, losses) };
+    });
+
+    upd((p) => ({
+      ...p,
+      players: updP,
+      history: p.history.map((h) =>
+        h.id === historyId ? { ...h, winner: newWinner } : h
+      ),
+    }));
+    showToast("勝敗を修正しました");
+  }
+
+  // 履歴の試合を削除
+  function deleteHistoryMatch(historyId) {
+    const target = history.find((h) => h.id === historyId);
+    if (!target) return;
+
+    // その試合での勝敗をプレイヤーから引く
+    const winIds = new Set(
+      (target.winner === 1 ? target.team1 : target.team2).map((p) => p.id)
+    );
+    const loseIds = new Set(
+      (target.winner === 1 ? target.team2 : target.team1).map((p) => p.id)
+    );
+    const updP = players.map((p) => ({
+      ...p,
+      wins: Math.max(0, (p.wins || 0) - (winIds.has(p.id) ? 1 : 0)),
+      losses: Math.max(0, (p.losses || 0) - (loseIds.has(p.id) ? 1 : 0)),
+    }));
+
+    upd((p) => ({
+      ...p,
+      players: updP,
+      history: p.history.filter((h) => h.id !== historyId),
+    }));
+    showToast("試合を削除しました");
+  }
+
+  // 休憩状態のトグル(参加者・管理者どちらからも呼べる)
+  function toggleResting(pid) {
+    const player = players.find((p) => p.id === pid);
+    if (!player) return;
+    const restingIds = d.restingIds || [];
+    const isResting = restingIds.includes(pid);
+
+    upd((p) => ({
+      ...p,
+      restingIds: isResting
+        ? p.restingIds.filter((x) => x !== pid)
+        : [...(p.restingIds || []), pid],
+    }));
+    showToast(isResting ? `${player.name} 復帰` : `${player.name} 休憩中`);
+  }
+
+  // シングルスモードの切り替え
+  function toggleSinglesMode() {
+    const newMode = !d.singlesMode;
+    upd((p) => ({ ...p, singlesMode: newMode }));
+    showToast(newMode ? "シングルスモードに切替" : "ダブルスモードに切替");
   }
 
   // メンバー入れ替え: 試合中の player を、別の player と入れ替える
@@ -832,6 +1015,118 @@ function App() {
     showToast("セッションを削除しました");
   }
 
+  // 過去セッションの名前変更
+  function renameArchive(sessionId, newName) {
+    if (!newName || !newName.trim()) return;
+    const trimmed = newName.trim();
+    upd((p) => ({
+      ...p,
+      savedSessions: (p.savedSessions || []).map((s) =>
+        s.id === sessionId ? { ...s, name: trimmed } : s
+      ),
+      attendanceLog: (p.attendanceLog || []).map((a) =>
+        a.sessionId === sessionId ? { ...a, sessionName: trimmed } : a
+      ),
+    }));
+    showToast("セッション名を変更しました");
+  }
+
+  // 過去セッション内の試合の勝者を変更
+  function editArchiveMatch(sessionId, historyId, newWinner) {
+    upd((p) => ({
+      ...p,
+      savedSessions: (p.savedSessions || []).map((s) => {
+        if (s.id !== sessionId) return s;
+        const target = (s.history || []).find((h) => h.id === historyId);
+        if (!target || target.winner === newWinner) return s;
+        const oldWinTeam = target.winner === 1 ? target.team1 : target.team2;
+        const oldLoseTeam = target.winner === 1 ? target.team2 : target.team1;
+        const newWinTeam = newWinner === 1 ? target.team1 : target.team2;
+        const newLoseTeam = newWinner === 1 ? target.team2 : target.team1;
+        const oldWinIds = new Set(oldWinTeam.map((p) => p.id));
+        const oldLoseIds = new Set(oldLoseTeam.map((p) => p.id));
+        const newWinIds = new Set(newWinTeam.map((p) => p.id));
+        const newLoseIds = new Set(newLoseTeam.map((p) => p.id));
+        const updP = (s.players || []).map((pp) => {
+          let wins = pp.wins || 0;
+          let losses = pp.losses || 0;
+          if (oldWinIds.has(pp.id)) wins -= 1;
+          if (oldLoseIds.has(pp.id)) losses -= 1;
+          if (newWinIds.has(pp.id)) wins += 1;
+          if (newLoseIds.has(pp.id)) losses += 1;
+          return { ...pp, wins: Math.max(0, wins), losses: Math.max(0, losses) };
+        });
+        return {
+          ...s,
+          players: updP,
+          history: s.history.map((h) =>
+            h.id === historyId ? { ...h, winner: newWinner } : h
+          ),
+        };
+      }),
+    }));
+    showToast("勝敗を修正しました");
+  }
+
+  // 過去セッション内の試合を削除
+  function deleteArchiveMatch(sessionId, historyId) {
+    upd((p) => ({
+      ...p,
+      savedSessions: (p.savedSessions || []).map((s) => {
+        if (s.id !== sessionId) return s;
+        const target = (s.history || []).find((h) => h.id === historyId);
+        if (!target) return s;
+        const winIds = new Set(
+          (target.winner === 1 ? target.team1 : target.team2).map((p) => p.id)
+        );
+        const loseIds = new Set(
+          (target.winner === 1 ? target.team2 : target.team1).map((p) => p.id)
+        );
+        const updP = (s.players || []).map((pp) => ({
+          ...pp,
+          wins: Math.max(0, (pp.wins || 0) - (winIds.has(pp.id) ? 1 : 0)),
+          losses: Math.max(0, (pp.losses || 0) - (loseIds.has(pp.id) ? 1 : 0)),
+        }));
+        return {
+          ...s,
+          players: updP,
+          history: s.history.filter((h) => h.id !== historyId),
+        };
+      }),
+    }));
+    showToast("試合を削除しました");
+  }
+
+  // 過去セッションから参加者を削除
+  function deleteArchivePlayer(sessionId, playerId) {
+    upd((p) => ({
+      ...p,
+      savedSessions: (p.savedSessions || []).map((s) => {
+        if (s.id !== sessionId) return s;
+        // その人が含まれる試合も削除
+        return {
+          ...s,
+          players: (s.players || []).filter((pp) => pp.id !== playerId),
+          history: (s.history || []).filter(
+            (h) =>
+              !h.team1.some((pp) => pp.id === playerId) &&
+              !h.team2.some((pp) => pp.id === playerId)
+          ),
+        };
+      }),
+      attendanceLog: (p.attendanceLog || []).map((a) =>
+        a.sessionId === sessionId
+          ? {
+              ...a,
+              playerIds: (a.playerIds || []).filter((id) => id !== playerId),
+              playerNames: (a.playerNames || []).filter((_, i) => (a.playerIds || [])[i] !== playerId),
+            }
+          : a
+      ),
+    }));
+    showToast("参加者を削除しました");
+  }
+
   // Stats
   const playCount = {};
   players.forEach((p) => (playCount[p.id] = 0));
@@ -866,11 +1161,21 @@ function App() {
     startMatches,
     regenMatches,
     finishMatch,
+    editHistoryWinner,
+    deleteHistoryMatch,
     swapPlayer,
+    toggleResting,
+    toggleSinglesMode,
     resetAll,
     newSession,
     archiveCurrent,
     deleteArchive,
+    renameArchive,
+    editArchiveMatch,
+    deleteArchiveMatch,
+    deleteArchivePlayer,
+    undo,
+    undoCount,
     setMode,
   };
 
@@ -1933,13 +2238,18 @@ function Status({ ctx }) {
     d,
     myPlayer,
     finishMatch,
+    editHistoryWinner,
+    deleteHistoryMatch,
     swapPlayer,
+    toggleResting,
     regenMatches,
     setMode,
   } = ctx;
 
   // 履歴の全件展開フラグ
   const [showAllHistory, setShowAllHistory] = useState(false);
+  // 履歴メニュー開閉
+  const [openMenuId, setOpenMenuId] = useState(null);
 
   // 「新試合」ハイライト管理: lastNewMatchAt から30秒間
   const NEW_HIGHLIGHT_MS = 30000;
@@ -2200,7 +2510,8 @@ function Status({ ctx }) {
                 );
                 const iw = waiting.some((x) => x.id === p.id);
                 const isMe = myPlayer?.id === p.id;
-                const stat = im ? "playing" : iw ? "waiting" : "idle";
+                const isResting = (d.restingIds || []).includes(p.id);
+                const stat = isResting ? "resting" : im ? "playing" : iw ? "waiting" : "idle";
                 const statStyle = {
                   playing: {
                     bg: T.primarySoft,
@@ -2213,6 +2524,12 @@ function Status({ ctx }) {
                     color: T.warn,
                     border: T.warn,
                     label: "待機",
+                  },
+                  resting: {
+                    bg: "#eef0ec",
+                    color: T.inkSoft,
+                    border: "#c7ccc4",
+                    label: "休憩中",
                   },
                   idle: {
                     bg: T.surfaceWarm,
@@ -2232,6 +2549,7 @@ function Status({ ctx }) {
                       background: isMe ? T.primarySoft : T.surface,
                       border: `1px solid ${isMe ? T.primary : T.line}`,
                       borderRadius: 12,
+                      opacity: isResting ? 0.7 : 1,
                     }}
                   >
                     <span
@@ -2281,6 +2599,29 @@ function Status({ ctx }) {
                     >
                       {statStyle.label}
                     </span>
+                    {/* 休憩トグル(本人 or 試合外の人だけ) */}
+                    {(isMe || !im) && (
+                      <button
+                        onClick={() => toggleResting(p.id)}
+                        style={{
+                          background: isResting ? T.warn : T.surfaceWarm,
+                          border: `1px solid ${isResting ? T.warn : T.line}`,
+                          color: isResting ? T.surface : T.inkSoft,
+                          width: 32,
+                          height: 28,
+                          borderRadius: 7,
+                          fontSize: 14,
+                          flexShrink: 0,
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                        }}
+                        aria-label={isResting ? "復帰" : "休憩"}
+                        title={isResting ? "復帰" : "休憩"}
+                      >
+                        {isResting ? "↩" : "☕"}
+                      </button>
+                    )}
                   </div>
                 );
               })}
@@ -2356,54 +2697,168 @@ function Status({ ctx }) {
                 .map((m) => {
                   const wt = m.winner === 1 ? m.team1 : m.team2;
                   const lt = m.winner === 1 ? m.team2 : m.team1;
+                  const isMenuOpen = openMenuId === m.id;
                   return (
                     <div
                       key={m.id}
                       style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 10,
-                        padding: "10px 14px",
                         background: T.surface,
                         borderRadius: 12,
-                        border: `1px solid ${T.line}`,
+                        border: `1px solid ${isMenuOpen ? T.primary : T.line}`,
+                        overflow: "hidden",
+                        transition: "border-color .15s",
                       }}
                     >
-                      <span
-                        className="mono"
+                      <div
                         style={{
-                          background: T.primary,
-                          color: T.surface,
-                          fontSize: 9,
-                          fontWeight: 700,
-                          padding: "3px 8px",
-                          borderRadius: 6,
-                          flexShrink: 0,
-                          letterSpacing: ".1em",
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 10,
+                          padding: "10px 14px",
                         }}
                       >
-                        C{m.court}
-                      </span>
-                      <div style={{ flex: 1, fontSize: 13, lineHeight: 1.4, minWidth: 0 }}>
-                        <span style={{ color: T.primary, fontWeight: 700 }}>
-                          {wt.map((p) => p.name).join(" / ")}
+                        <span
+                          className="mono"
+                          style={{
+                            background: T.primary,
+                            color: T.surface,
+                            fontSize: 9,
+                            fontWeight: 700,
+                            padding: "3px 8px",
+                            borderRadius: 6,
+                            flexShrink: 0,
+                            letterSpacing: ".1em",
+                          }}
+                        >
+                          C{m.court}
                         </span>
-                        <span style={{ color: T.inkSoft, fontSize: 12 }}>
-                          {" "}
-                          vs {lt.map((p) => p.name).join(" / ")}
+                        <div style={{ flex: 1, fontSize: 13, lineHeight: 1.4, minWidth: 0 }}>
+                          <span style={{ color: T.primary, fontWeight: 700 }}>
+                            {wt.map((p) => p.name).join(" / ")}
+                          </span>
+                          <span style={{ color: T.inkSoft, fontSize: 12 }}>
+                            {" "}vs {lt.map((p) => p.name).join(" / ")}
+                          </span>
+                        </div>
+                        <span
+                          className="mono"
+                          style={{ fontSize: 10, color: T.inkSoft, flexShrink: 0 }}
+                        >
+                          {m.endedAt
+                            ? new Date(m.endedAt).toLocaleTimeString("ja-JP", {
+                                hour: "2-digit",
+                                minute: "2-digit",
+                              })
+                            : ""}
                         </span>
+                        <button
+                          onClick={() => setOpenMenuId(isMenuOpen ? null : m.id)}
+                          style={{
+                            background: isMenuOpen ? T.primary : T.surfaceWarm,
+                            border: `1px solid ${isMenuOpen ? T.primary : T.line}`,
+                            color: isMenuOpen ? T.surface : T.inkSoft,
+                            width: 28,
+                            height: 28,
+                            borderRadius: 7,
+                            fontSize: 14,
+                            fontWeight: 700,
+                            flexShrink: 0,
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            lineHeight: 1,
+                          }}
+                          aria-label="メニュー"
+                        >
+                          ⋯
+                        </button>
                       </div>
-                      <span
-                        className="mono"
-                        style={{ fontSize: 10, color: T.inkSoft, flexShrink: 0 }}
-                      >
-                        {m.endedAt
-                          ? new Date(m.endedAt).toLocaleTimeString("ja-JP", {
-                              hour: "2-digit",
-                              minute: "2-digit",
-                            })
-                          : ""}
-                      </span>
+                      {isMenuOpen && (
+                        <div
+                          className="bm-fade"
+                          style={{
+                            padding: "10px 14px 12px",
+                            borderTop: `1px solid ${T.lineSoft}`,
+                            background: T.surfaceWarm,
+                          }}
+                        >
+                          <div
+                            className="mono"
+                            style={{
+                              fontSize: 9,
+                              letterSpacing: ".15em",
+                              color: T.inkSoft,
+                              fontWeight: 700,
+                              marginBottom: 6,
+                              textTransform: "uppercase",
+                            }}
+                          >
+                            勝敗を修正
+                          </div>
+                          <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                            <button
+                              onClick={() => {
+                                editHistoryWinner(m.id, 1);
+                                setOpenMenuId(null);
+                              }}
+                              style={{
+                                flex: 1,
+                                padding: "8px",
+                                background: m.winner === 1 ? T.primary : T.surface,
+                                border: `1.5px solid ${T.primary}`,
+                                borderRadius: 8,
+                                color: m.winner === 1 ? T.surface : T.primary,
+                                fontSize: 11,
+                                fontWeight: 700,
+                                lineHeight: 1.3,
+                              }}
+                            >
+                              {m.winner === 1 && "✓ "}
+                              {m.team1.map((p) => p.name).join("/")}
+                            </button>
+                            <button
+                              onClick={() => {
+                                editHistoryWinner(m.id, 2);
+                                setOpenMenuId(null);
+                              }}
+                              style={{
+                                flex: 1,
+                                padding: "8px",
+                                background: m.winner === 2 ? T.primary : T.surface,
+                                border: `1.5px solid ${T.primary}`,
+                                borderRadius: 8,
+                                color: m.winner === 2 ? T.surface : T.primary,
+                                fontSize: 11,
+                                fontWeight: 700,
+                                lineHeight: 1.3,
+                              }}
+                            >
+                              {m.winner === 2 && "✓ "}
+                              {m.team2.map((p) => p.name).join("/")}
+                            </button>
+                          </div>
+                          <button
+                            onClick={() => {
+                              if (window.confirm("この試合を削除しますか?\n勝敗の集計も自動的に修正されます。")) {
+                                deleteHistoryMatch(m.id);
+                                setOpenMenuId(null);
+                              }
+                            }}
+                            style={{
+                              width: "100%",
+                              padding: "8px",
+                              background: T.surface,
+                              border: `1px solid ${T.danger}`,
+                              borderRadius: 8,
+                              color: T.danger,
+                              fontSize: 11,
+                              fontWeight: 700,
+                            }}
+                          >
+                            この試合を削除
+                          </button>
+                        </div>
+                      )}
                     </div>
                   );
                 })}
@@ -2980,13 +3435,23 @@ function Admin({ ctx }) {
     startMatches,
     regenMatches,
     finishMatch,
+    editHistoryWinner,
+    deleteHistoryMatch,
     swapPlayer,
+    toggleResting,
+    toggleSinglesMode,
     removePlayer,
     addPlayer,
     resetAll,
     newSession,
     archiveCurrent,
     deleteArchive,
+    renameArchive,
+    editArchiveMatch,
+    deleteArchiveMatch,
+    deleteArchivePlayer,
+    undo,
+    undoCount,
     upd,
     setMode,
     showToast,
@@ -3056,7 +3521,33 @@ function Admin({ ctx }) {
             </div>
           </div>
         </div>
-        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 3 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          {/* Undoボタン */}
+          <button
+            onClick={undo}
+            disabled={undoCount === 0}
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              justifyContent: "center",
+              padding: "4px 10px",
+              borderRadius: 8,
+              background: undoCount > 0 ? "rgba(244,211,94,.2)" : "rgba(255,255,255,.06)",
+              border: `1px solid ${undoCount > 0 ? T.accent : "rgba(255,255,255,.1)"}`,
+              color: undoCount > 0 ? T.accent : "rgba(255,255,255,.3)",
+              cursor: undoCount > 0 ? "pointer" : "not-allowed",
+              minWidth: 50,
+            }}
+            aria-label="元に戻す"
+          >
+            <span style={{ fontSize: 14, fontWeight: 700, lineHeight: 1 }}>↶</span>
+            <span className="mono" style={{ fontSize: 8, letterSpacing: ".1em", marginTop: 2 }}>
+              UNDO {undoCount > 0 ? `(${undoCount})` : ""}
+            </span>
+          </button>
+
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 3 }}>
           <span
             className="mono"
             style={{
@@ -3109,6 +3600,7 @@ function Admin({ ctx }) {
             >
               ＋
             </button>
+          </div>
           </div>
         </div>
       </div>
@@ -3165,77 +3657,134 @@ function Admin({ ctx }) {
       </div>
 
       <div style={{ padding: 16, maxWidth: 540, margin: "0 auto" }}>
-        {tab === "matches" &&
-          (!d.started ? (
-            <div style={{ textAlign: "center", padding: "40px 16px" }}>
-              <div
+        {tab === "matches" && (
+          <>
+            {/* シングルス/ダブルスモード切替 */}
+            <div
+              style={{
+                background: T.surface,
+                border: `1px solid ${T.line}`,
+                borderRadius: 12,
+                padding: 4,
+                marginBottom: 16,
+                display: "flex",
+                gap: 4,
+              }}
+            >
+              <button
+                onClick={() => d.singlesMode && toggleSinglesMode()}
                 style={{
-                  width: 70,
-                  height: 70,
-                  margin: "0 auto 18px",
-                  borderRadius: "50%",
-                  background: T.primarySoft,
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  color: T.primary,
+                  flex: 1,
+                  padding: "10px",
+                  background: !d.singlesMode ? T.primary : "transparent",
+                  border: "none",
+                  borderRadius: 9,
+                  color: !d.singlesMode ? T.surface : T.inkSoft,
+                  fontSize: 13,
+                  fontWeight: 700,
+                  boxShadow: !d.singlesMode ? "0 2px 6px rgba(10,135,84,.25)" : "none",
                 }}
               >
-                <IconShuttle size={36} />
-              </div>
-              <div
+                ダブルス (4人)
+              </button>
+              <button
+                onClick={() => !d.singlesMode && toggleSinglesMode()}
                 style={{
-                  fontSize: 20,
-                  fontWeight: 900,
-                  letterSpacing: "-.02em",
-                  marginBottom: 8,
+                  flex: 1,
+                  padding: "10px",
+                  background: d.singlesMode ? T.primary : "transparent",
+                  border: "none",
+                  borderRadius: 9,
+                  color: d.singlesMode ? T.surface : T.inkSoft,
+                  fontSize: 13,
+                  fontWeight: 700,
+                  boxShadow: d.singlesMode ? "0 2px 6px rgba(10,135,84,.25)" : "none",
                 }}
               >
-                試合を始める
-              </div>
-              <div
-                style={{
-                  color: T.inkSoft,
-                  fontSize: 14,
-                  lineHeight: 1.7,
-                  marginBottom: 26,
-                }}
-              >
-                {players.length < 4
-                  ? `あと ${4 - players.length} 人必要です`
-                  : `${players.length}人 → ${Math.min(
-                      Math.floor(players.length / 4),
-                      d.courts
-                    )}試合 / ${d.courts}コート`}
-              </div>
-              <Btn disabled={players.length < 4} onClick={startMatches}>
-                試合開始
-              </Btn>
+                シングルス (2人)
+              </button>
             </div>
-          ) : (
-            <div>
-              {matches.length === 0 && waiting.length === 0 ? (
-                <Empty title="全試合完了" sub="参加者を追加して再開できます" />
-              ) : (
-                [...matches]
-                  .sort((a, b) => {
-                    const an = newIds.has(a.id) ? 0 : 1;
-                    const bn = newIds.has(b.id) ? 0 : 1;
-                    if (an !== bn) return an - bn;
-                    return a.court - b.court;
-                  })
-                  .map((m) => (
-                    <MCard
-                      key={m.id}
-                      match={m}
-                      onFinish={finishMatch}
-                      myPlayer={null}
-                      isNew={newIds.has(m.id)}
-                      onSwap={swapPlayer}
-                      allPlayers={players}
-                      allMatches={matches}
-                    />
-                  ))
+            {d.started && (
+              <div style={{ fontSize: 11, color: T.inkSoft, marginBottom: 12, padding: "0 4px", lineHeight: 1.5 }}>
+                ※モードを切り替えると、次の試合生成時から反映されます
+              </div>
+            )}
+            {!d.started ? (
+              <div style={{ textAlign: "center", padding: "40px 16px" }}>
+                <div
+                  style={{
+                    width: 70,
+                    height: 70,
+                    margin: "0 auto 18px",
+                    borderRadius: "50%",
+                    background: T.primarySoft,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    color: T.primary,
+                  }}
+                >
+                  <IconShuttle size={36} />
+                </div>
+                <div
+                  style={{
+                    fontSize: 20,
+                    fontWeight: 900,
+                    letterSpacing: "-.02em",
+                    marginBottom: 8,
+                  }}
+                >
+                  試合を始める
+                </div>
+                <div
+                  style={{
+                    color: T.inkSoft,
+                    fontSize: 14,
+                    lineHeight: 1.7,
+                    marginBottom: 26,
+                  }}
+                >
+                  {(() => {
+                    const ppm = d.singlesMode ? 2 : 4;
+                    const restCount = (d.restingIds || []).length;
+                    const activeCount = players.length - restCount;
+                    if (activeCount < ppm) {
+                      return `あと ${ppm - activeCount} 人必要です${restCount > 0 ? ` (休憩中 ${restCount}人を除く)` : ""}`;
+                    }
+                    return `${activeCount}人 → ${Math.min(
+                      Math.floor(activeCount / ppm),
+                      d.courts
+                    )}試合 / ${d.courts}コート${restCount > 0 ? ` (休憩中 ${restCount}人を除く)` : ""}`;
+                  })()}
+                </div>
+                <Btn disabled={players.length - (d.restingIds || []).length < (d.singlesMode ? 2 : 4)} onClick={startMatches}>
+                  試合開始
+                </Btn>
+              </div>
+            ) : (
+              <div>
+                {matches.length === 0 && waiting.length === 0 ? (
+                  <Empty title="全試合完了" sub="参加者を追加して再開できます" />
+                ) : (
+                  [...matches]
+                    .sort((a, b) => {
+                      const an = newIds.has(a.id) ? 0 : 1;
+                      const bn = newIds.has(b.id) ? 0 : 1;
+                      if (an !== bn) return an - bn;
+                      return a.court - b.court;
+                    })
+                    .map((m) => (
+                      <MCard
+                        key={m.id}
+                        match={m}
+                        onFinish={finishMatch}
+                        myPlayer={null}
+                        isNew={newIds.has(m.id)}
+                        onSwap={swapPlayer}
+                        allPlayers={players}
+                        allMatches={matches}
+                      />
+                    ))
               )}
               {waiting.length > 0 && (
                 <div
@@ -3284,13 +3833,17 @@ function Admin({ ctx }) {
                 ↻ 組み合わせを再生成
               </button>
             </div>
-          ))}
+            )}
+          </>
+        )}
         {tab === "players" && (
           <APlayers
             players={players}
             playCount={playCount}
             onAdd={addPlayer}
             onRemove={removePlayer}
+            restingIds={d.restingIds || []}
+            onToggleResting={toggleResting}
           />
         )}
         {tab === "session" && (
@@ -3308,6 +3861,10 @@ function Admin({ ctx }) {
             savedSessions={d.savedSessions || []}
             attendanceLog={d.attendanceLog || []}
             onDelete={deleteArchive}
+            onRename={renameArchive}
+            onEditMatch={editArchiveMatch}
+            onDeleteMatch={deleteArchiveMatch}
+            onDeletePlayer={deleteArchivePlayer}
           />
         )}
       </div>
@@ -3315,10 +3872,11 @@ function Admin({ ctx }) {
   );
 }
 
-function APlayers({ players, playCount, onAdd, onRemove }) {
+function APlayers({ players, playCount, onAdd, onRemove, restingIds, onToggleResting }) {
   const [name, setName] = useState("");
   const taken = new Set(players.map((p) => p.name.toLowerCase()));
   const dupe = name.trim() && taken.has(name.trim().toLowerCase());
+  const restSet = new Set(restingIds || []);
 
   function add() {
     if (!name.trim() || dupe) return;
@@ -3417,6 +3975,26 @@ function APlayers({ players, playCount, onAdd, onRemove }) {
               <span className="mono" style={{ fontSize: 11, color: T.inkSoft, flexShrink: 0 }}>
                 {p.wins || 0}W·{p.losses || 0}L · {playCount[p.id] || 0}試合
               </span>
+              <button
+                onClick={() => onToggleResting && onToggleResting(p.id)}
+                style={{
+                  background: restSet.has(p.id) ? T.warn : T.surfaceWarm,
+                  border: `1px solid ${restSet.has(p.id) ? T.warn : T.line}`,
+                  color: restSet.has(p.id) ? T.surface : T.inkSoft,
+                  width: 32,
+                  height: 28,
+                  borderRadius: 7,
+                  fontSize: 14,
+                  flexShrink: 0,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+                aria-label={restSet.has(p.id) ? "復帰" : "休憩"}
+                title={restSet.has(p.id) ? "復帰" : "休憩"}
+              >
+                {restSet.has(p.id) ? "↩" : "☕"}
+              </button>
               <button
                 onClick={() => onRemove(p.id)}
                 style={{
@@ -3716,7 +4294,7 @@ function SessionPanel({ sessionStart, playerCount, historyCount, onNewSession, o
 // ═══════════════════════════════════════════════════════════
 // HistoryPanel — 過去セッションと参加者傾向の閲覧
 // ═══════════════════════════════════════════════════════════
-function HistoryPanel({ savedSessions, attendanceLog, onDelete }) {
+function HistoryPanel({ savedSessions, attendanceLog, onDelete, onRename, onEditMatch, onDeleteMatch, onDeletePlayer }) {
   const [selectedId, setSelectedId] = useState(null);
   const [view, setView] = useState("list"); // list | trends
 
@@ -3736,6 +4314,10 @@ function HistoryPanel({ savedSessions, attendanceLog, onDelete }) {
             setSelectedId(null);
           }
         }}
+        onRename={(newName) => onRename(selected.id, newName)}
+        onEditMatch={(historyId, winner) => onEditMatch(selected.id, historyId, winner)}
+        onDeleteMatch={(historyId) => onDeleteMatch(selected.id, historyId)}
+        onDeletePlayer={(playerId) => onDeletePlayer(selected.id, playerId)}
       />
     );
   }
@@ -3872,8 +4454,232 @@ function SavedSessionList({ savedSessions, onSelect }) {
   );
 }
 
+// ── PDF出力(印刷用ウィンドウを開いてwindow.print()) ──
+function exportSessionPDF(session, playCount, ranked, dateStr) {
+  const title = session.name;
+  const players = session.players || [];
+  const history = session.history || [];
+
+  // 参加者一覧 HTML
+  const playerRows = players
+    .map((p, i) => {
+      const tot = (p.wins || 0) + (p.losses || 0);
+      const rate = tot > 0 ? Math.round(((p.wins || 0) / tot) * 100) : 0;
+      return `<tr>
+        <td class="num">${String(i + 1).padStart(2, "0")}</td>
+        <td class="name">${escapeHtml(p.name)}</td>
+        <td class="mono">${playCount[p.id] || 0}試合</td>
+        <td class="mono">${p.wins || 0}W·${p.losses || 0}L</td>
+        <td class="mono ${rate >= 50 ? "good" : ""}">${tot > 0 ? rate + "%" : "—"}</td>
+      </tr>`;
+    })
+    .join("");
+
+  // ランキング HTML
+  const rankRows = ranked
+    .map((p, i) => {
+      const tot = (p.wins || 0) + (p.losses || 0);
+      const rate = Math.round(((p.wins || 0) / tot) * 100);
+      const medals = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩"];
+      return `<tr>
+        <td class="num medal">${medals[i] || i + 1}</td>
+        <td class="name">${escapeHtml(p.name)}</td>
+        <td class="mono">${p.wins}W·${p.losses}L</td>
+        <td class="mono ${rate >= 50 ? "good" : ""}">${rate}%</td>
+      </tr>`;
+    })
+    .join("");
+
+  // 試合履歴 HTML
+  const matchRows = history
+    .map((m, idx) => {
+      const wt = m.winner === 1 ? m.team1 : m.team2;
+      const lt = m.winner === 1 ? m.team2 : m.team1;
+      return `<tr>
+        <td class="num">${String(idx + 1).padStart(2, "0")}</td>
+        <td class="court">C${m.court}</td>
+        <td class="team winner">${wt.map((p) => escapeHtml(p.name)).join(" / ")}</td>
+        <td class="vs">vs</td>
+        <td class="team">${lt.map((p) => escapeHtml(p.name)).join(" / ")}</td>
+      </tr>`;
+    })
+    .join("");
+
+  // テンプレートリテラル内に closing-title / closing-style / closing-script タグが
+  // あると、ブラウザのHTMLパーサーが「text/babel」スクリプトの中身を
+  // パースする際に終端と勘違いすることがある。
+  // → 動的に閉じタグを構築する関数で逃げる
+  const _ = (tag) => "<" + "/" + tag + ">";
+  
+  const html = `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<title>${escapeHtml(title)} - 試合結果${_("title")}
+<style>
+  @page { size: A4; margin: 14mm 12mm; }
+  @media print {
+    body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    .no-print { display: none !important; }
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "Hiragino Sans", "Yu Gothic", sans-serif;
+    color: #0f1612;
+    background: #fff;
+    line-height: 1.5;
+    font-size: 10pt;
+    padding: 0;
+  }
+  .container { max-width: 180mm; margin: 0 auto; padding: 8mm; }
+  .hero {
+    background: #0f1612;
+    color: #fff;
+    padding: 14px 18px;
+    border-radius: 8px;
+    margin-bottom: 18px;
+    page-break-after: avoid;
+  }
+  .hero .eye {
+    font-family: "Menlo", monospace;
+    font-size: 8pt;
+    color: #f4d35e;
+    letter-spacing: .2em;
+    text-transform: uppercase;
+    font-weight: 700;
+    margin-bottom: 4px;
+  }
+  .hero h1 {
+    font-size: 24pt;
+    font-weight: 900;
+    letter-spacing: -.02em;
+    margin: 0 0 4px;
+  }
+  .hero .meta {
+    font-family: "Menlo", monospace;
+    font-size: 9pt;
+    opacity: 0.7;
+  }
+  .hero .stats {
+    display: flex;
+    gap: 24px;
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px solid rgba(255,255,255,.15);
+  }
+  .hero .stat .v { font-family: "Menlo", monospace; font-size: 16pt; font-weight: 700; color: #f4d35e; }
+  .hero .stat .l { font-size: 8pt; opacity: 0.55; letter-spacing: .1em; text-transform: uppercase; }
+  h2 {
+    font-size: 12pt;
+    font-weight: 700;
+    margin: 18px 0 8px;
+    padding-bottom: 4px;
+    border-bottom: 2px solid #0a8754;
+    page-break-after: avoid;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 8px;
+    page-break-inside: auto;
+  }
+  tr { page-break-inside: avoid; }
+  td {
+    padding: 5px 8px;
+    border-bottom: 1px solid #e8e3d3;
+    font-size: 9.5pt;
+    vertical-align: middle;
+  }
+  .mono { font-family: "Menlo", monospace; font-size: 9pt; color: #5a6660; }
+  .num { width: 28px; color: #5a6660; font-family: "Menlo", monospace; font-size: 8.5pt; }
+  .medal { font-size: 12pt; color: #0a8754; width: 32px; }
+  .name { font-weight: 600; }
+  .good { color: #0a8754; font-weight: 700; }
+  .court { width: 32px; background: #0a8754; color: #fff; text-align: center; font-family: "Menlo", monospace; font-size: 8pt; font-weight: 700; border-radius: 4px; padding: 2px 4px; }
+  .team { font-size: 9.5pt; }
+  .team.winner { color: #0a8754; font-weight: 700; }
+  .vs { width: 22px; font-family: "Menlo", monospace; font-size: 8pt; color: #5a6660; text-align: center; }
+  .empty { padding: 12px; text-align: center; color: #5a6660; font-style: italic; }
+  .footer { margin-top: 16px; padding-top: 10px; border-top: 1px solid #d4cfbf; font-size: 8pt; color: #5a6660; text-align: center; font-family: "Menlo", monospace; }
+  .no-print {
+    position: fixed;
+    top: 12px;
+    right: 12px;
+    background: #0a8754;
+    color: #fff;
+    padding: 10px 18px;
+    border-radius: 8px;
+    border: none;
+    font-size: 14px;
+    font-weight: 700;
+    cursor: pointer;
+    box-shadow: 0 4px 12px rgba(0,0,0,.15);
+  }
+${_("style")}
+${_("head")}
+<body>
+<button class="no-print" onclick="window.print()">🖨 印刷 / PDFで保存</button>
+<div class="container">
+  <div class="hero">
+    <div class="eye">Genki.B.C · Session Result</div>
+    <h1>${escapeHtml(title)}${_("h1")}
+    <div class="meta">${escapeHtml(dateStr)}${_("div")}
+    <div class="stats">
+      <div class="stat"><div class="v">${players.length}${_("div")}<div class="l">参加者${_("div")}${_("div")}
+      <div class="stat"><div class="v">${history.length}${_("div")}<div class="l">試合数${_("div")}${_("div")}
+    ${_("div")}
+  ${_("div")}
+
+  <h2>参加者 · ${players.length}人${_("h2")}
+  ${players.length === 0 ? '<div class="empty">参加者がいません' + _("div") : `<table><tbody>${playerRows}` + _("tbody") + _("table")}
+
+  ${ranked.length > 0 ? `<h2>ランキング` + _("h2") + `<table><tbody>${rankRows}` + _("tbody") + _("table") : ""}
+
+  <h2>全試合 · ${history.length}件${_("h2")}
+  ${history.length === 0 ? '<div class="empty">試合履歴がありません' + _("div") : `<table><tbody>${matchRows}` + _("tbody") + _("table")}
+
+  <div class="footer">Generated by Genki.B.C Badminton Manager · ${new Date().toLocaleDateString("ja-JP")}${_("div")}
+${_("div")}
+<` + `script>
+  // 印刷ダイアログを自動で開く(モバイル除く)
+  setTimeout(() => { try { window.print(); } catch (e) {} }, 400);
+</` + `script>
+${_("body")}
+${_("html")}`;
+
+  // 新しいウィンドウで開く
+  const w = window.open("", "_blank");
+  if (!w) {
+    alert("ポップアップがブロックされました。ブラウザの設定でポップアップを許可してください。");
+    return;
+  }
+  w.document.open();
+  w.document.write(html);
+  w.document.close();
+}
+
+function escapeHtml(str) {
+  if (str === null || str === undefined) return "";
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 // ── セッション詳細 ──
-function SessionDetailView({ session, onBack, onDelete }) {
+function SessionDetailView({ session, onBack, onDelete, onRename, onEditMatch, onDeleteMatch, onDeletePlayer }) {
+  const [editMode, setEditMode] = useState(false);
+  const [nameDraft, setNameDraft] = useState(session.name);
+  const [openMatchMenuId, setOpenMatchMenuId] = useState(null);
+  const [showPdf, setShowPdf] = useState(false);
+
+  // session が変わったら nameDraft も同期
+  useEffect(() => {
+    setNameDraft(session.name);
+  }, [session.id, session.name]);
+
   const date = session.endedAt ? new Date(session.endedAt) : null;
   const dateStr = date
     ? date.toLocaleString("ja-JP", {
@@ -3903,20 +4709,57 @@ function SessionDetailView({ session, onBack, onDelete }) {
       return br - ar || (b.wins || 0) - (a.wins || 0);
     });
 
+  function handleSaveRename() {
+    if (nameDraft.trim() && nameDraft.trim() !== session.name) {
+      onRename(nameDraft.trim());
+    }
+  }
+
   return (
     <div>
-      <button
-        onClick={onBack}
-        style={{
-          background: "none",
-          color: T.inkSoft,
-          fontSize: 13,
-          padding: "4px 0",
-          marginBottom: 12,
-        }}
-      >
-        ← 履歴一覧に戻る
-      </button>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+        <button
+          onClick={onBack}
+          style={{
+            background: "none",
+            color: T.inkSoft,
+            fontSize: 13,
+            padding: "4px 0",
+            flex: 1,
+            textAlign: "left",
+          }}
+        >
+          ← 履歴一覧に戻る
+        </button>
+        <button
+          onClick={() => exportSessionPDF(session, playCount, ranked, dateStr)}
+          style={{
+            padding: "6px 12px",
+            background: T.surface,
+            border: `1px solid ${T.primary}`,
+            borderRadius: 7,
+            color: T.primary,
+            fontSize: 11,
+            fontWeight: 700,
+          }}
+        >
+          📄 PDF出力
+        </button>
+        <button
+          onClick={() => setEditMode((v) => !v)}
+          style={{
+            padding: "6px 12px",
+            background: editMode ? T.primary : T.surface,
+            border: `1px solid ${editMode ? T.primary : T.line}`,
+            borderRadius: 7,
+            color: editMode ? T.surface : T.ink,
+            fontSize: 11,
+            fontWeight: 700,
+          }}
+        >
+          {editMode ? "✓ 完了" : "✎ 編集"}
+        </button>
+      </div>
 
       <div
         style={{
@@ -3942,9 +4785,38 @@ function SessionDetailView({ session, onBack, onDelete }) {
         >
           Archived Session
         </div>
-        <div style={{ fontSize: 22, fontWeight: 900, letterSpacing: "-.02em", marginBottom: 4 }}>
-          {session.name}
-        </div>
+        {editMode ? (
+          <div style={{ marginBottom: 4 }}>
+            <input
+              value={nameDraft}
+              onChange={(e) => setNameDraft(e.target.value)}
+              onBlur={handleSaveRename}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.target.blur();
+                }
+              }}
+              style={{
+                width: "100%",
+                background: "rgba(255,255,255,.1)",
+                border: "1px dashed rgba(255,255,255,.3)",
+                borderRadius: 8,
+                color: T.surface,
+                fontSize: 20,
+                fontWeight: 900,
+                letterSpacing: "-.02em",
+                padding: "6px 10px",
+              }}
+            />
+            <div style={{ fontSize: 10, opacity: 0.55, marginTop: 4, fontStyle: "italic" }}>
+              ↑ タップして編集 · 完了で保存
+            </div>
+          </div>
+        ) : (
+          <div style={{ fontSize: 22, fontWeight: 900, letterSpacing: "-.02em", marginBottom: 4 }}>
+            {session.name}
+          </div>
+        )}
         <div className="mono" style={{ fontSize: 11, opacity: 0.6 }}>
           {dateStr}
         </div>
@@ -4025,6 +4897,29 @@ function SessionDetailView({ session, onBack, onDelete }) {
                   {rate}%
                 </span>
               )}
+              {editMode && (
+                <button
+                  onClick={() => {
+                    if (window.confirm(`「${p.name}」を削除しますか?\nこの人が含まれる試合も全て削除されます。`)) {
+                      onDeletePlayer(p.id);
+                    }
+                  }}
+                  style={{
+                    background: T.dangerSoft,
+                    border: "1px solid #f5c8c4",
+                    color: T.danger,
+                    width: 26,
+                    height: 26,
+                    borderRadius: 7,
+                    fontSize: 14,
+                    flexShrink: 0,
+                    marginLeft: 4,
+                  }}
+                  aria-label="削除"
+                >
+                  ×
+                </button>
+              )}
             </div>
           );
         })}
@@ -4097,55 +4992,152 @@ function SessionDetailView({ session, onBack, onDelete }) {
           session.history.map((m, idx) => {
             const wt = m.winner === 1 ? m.team1 : m.team2;
             const lt = m.winner === 1 ? m.team2 : m.team1;
+            const isOpen = openMatchMenuId === m.id;
             return (
               <div
                 key={m.id}
                 style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 10,
-                  padding: "10px 14px",
                   background: T.surface,
                   borderRadius: 10,
-                  border: `1px solid ${T.line}`,
+                  border: `1px solid ${isOpen ? T.primary : T.line}`,
+                  overflow: "hidden",
                 }}
               >
-                <span
-                  className="mono"
+                <div
                   style={{
-                    background: T.inkSoft,
-                    color: T.surface,
-                    fontSize: 8,
-                    fontWeight: 700,
-                    padding: "2px 5px",
-                    borderRadius: 4,
-                    flexShrink: 0,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    padding: "10px 14px",
                   }}
                 >
-                  {String(idx + 1).padStart(2, "0")}
-                </span>
-                <span
-                  className="mono"
-                  style={{
-                    background: T.primary,
-                    color: T.surface,
-                    fontSize: 9,
-                    fontWeight: 700,
-                    padding: "3px 7px",
-                    borderRadius: 5,
-                    flexShrink: 0,
-                  }}
-                >
-                  C{m.court}
-                </span>
-                <div style={{ flex: 1, fontSize: 12, lineHeight: 1.4, minWidth: 0 }}>
-                  <span style={{ color: T.primary, fontWeight: 700 }}>
-                    {wt.map((p) => p.name).join(" / ")}
+                  <span
+                    className="mono"
+                    style={{
+                      background: T.inkSoft,
+                      color: T.surface,
+                      fontSize: 8,
+                      fontWeight: 700,
+                      padding: "2px 5px",
+                      borderRadius: 4,
+                      flexShrink: 0,
+                    }}
+                  >
+                    {String(idx + 1).padStart(2, "0")}
                   </span>
-                  <span style={{ color: T.inkSoft, fontSize: 11 }}>
-                    {" "}vs {lt.map((p) => p.name).join(" / ")}
+                  <span
+                    className="mono"
+                    style={{
+                      background: T.primary,
+                      color: T.surface,
+                      fontSize: 9,
+                      fontWeight: 700,
+                      padding: "3px 7px",
+                      borderRadius: 5,
+                      flexShrink: 0,
+                    }}
+                  >
+                    C{m.court}
                   </span>
+                  <div style={{ flex: 1, fontSize: 12, lineHeight: 1.4, minWidth: 0 }}>
+                    <span style={{ color: T.primary, fontWeight: 700 }}>
+                      {wt.map((p) => p.name).join(" / ")}
+                    </span>
+                    <span style={{ color: T.inkSoft, fontSize: 11 }}>
+                      {" "}vs {lt.map((p) => p.name).join(" / ")}
+                    </span>
+                  </div>
+                  {editMode && (
+                    <button
+                      onClick={() => setOpenMatchMenuId(isOpen ? null : m.id)}
+                      style={{
+                        background: isOpen ? T.primary : T.surfaceWarm,
+                        border: `1px solid ${isOpen ? T.primary : T.line}`,
+                        color: isOpen ? T.surface : T.inkSoft,
+                        width: 26,
+                        height: 26,
+                        borderRadius: 6,
+                        fontSize: 13,
+                        fontWeight: 700,
+                        flexShrink: 0,
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                      }}
+                    >
+                      ⋯
+                    </button>
+                  )}
                 </div>
+                {editMode && isOpen && (
+                  <div style={{ padding: "10px 14px 12px", borderTop: `1px solid ${T.lineSoft}`, background: T.surfaceWarm }}>
+                    <div className="mono" style={{ fontSize: 9, letterSpacing: ".15em", color: T.inkSoft, fontWeight: 700, marginBottom: 6, textTransform: "uppercase" }}>
+                      勝敗を修正
+                    </div>
+                    <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                      <button
+                        onClick={() => {
+                          onEditMatch(m.id, 1);
+                          setOpenMatchMenuId(null);
+                        }}
+                        style={{
+                          flex: 1,
+                          padding: "8px",
+                          background: m.winner === 1 ? T.primary : T.surface,
+                          border: `1.5px solid ${T.primary}`,
+                          borderRadius: 8,
+                          color: m.winner === 1 ? T.surface : T.primary,
+                          fontSize: 11,
+                          fontWeight: 700,
+                          lineHeight: 1.3,
+                        }}
+                      >
+                        {m.winner === 1 && "✓ "}
+                        {m.team1.map((p) => p.name).join("/")}
+                      </button>
+                      <button
+                        onClick={() => {
+                          onEditMatch(m.id, 2);
+                          setOpenMatchMenuId(null);
+                        }}
+                        style={{
+                          flex: 1,
+                          padding: "8px",
+                          background: m.winner === 2 ? T.primary : T.surface,
+                          border: `1.5px solid ${T.primary}`,
+                          borderRadius: 8,
+                          color: m.winner === 2 ? T.surface : T.primary,
+                          fontSize: 11,
+                          fontWeight: 700,
+                          lineHeight: 1.3,
+                        }}
+                      >
+                        {m.winner === 2 && "✓ "}
+                        {m.team2.map((p) => p.name).join("/")}
+                      </button>
+                    </div>
+                    <button
+                      onClick={() => {
+                        if (window.confirm("この試合を削除しますか?\n勝敗の集計も自動的に修正されます。")) {
+                          onDeleteMatch(m.id);
+                          setOpenMatchMenuId(null);
+                        }
+                      }}
+                      style={{
+                        width: "100%",
+                        padding: "8px",
+                        background: T.surface,
+                        border: `1px solid ${T.danger}`,
+                        borderRadius: 8,
+                        color: T.danger,
+                        fontSize: 11,
+                        fontWeight: 700,
+                      }}
+                    >
+                      この試合を削除
+                    </button>
+                  </div>
+                )}
               </div>
             );
           })
