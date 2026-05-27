@@ -136,6 +136,91 @@ function yomiInitial(player) {
   return "他";
 }
 
+// ────────────────────────────────────────────
+// NameInput — 日本語IMEの変換前ひらがなをキャプチャする入力欄
+// 用途:
+//   ユーザーが「たなか」と打って「田中」に変換すると、変換確定時に
+//   onYomiHint("たなか")が呼ばれる(自動でふりがな欄に反映できる)
+// props:
+//   value, onChange, onYomiHint(yomi), placeholder, style, etc...
+// ────────────────────────────────────────────
+function NameInput({ value, onChange, onYomiHint, ...rest }) {
+  const composingRef = useRef(false);
+  // composition中(IME未確定中)の最新のひらがな入力を覚えておく
+  const lastCompositionDataRef = useRef("");
+  // 直前の名前値(変換前のひらがな状態を取得するため)
+  const lastValueRef = useRef(value || "");
+
+  function handleCompositionStart(e) {
+    composingRef.current = true;
+    lastCompositionDataRef.current = "";
+  }
+
+  function handleCompositionUpdate(e) {
+    // 変換中(IMEがひらがなを表示してる状態)のdataを覚えておく
+    // ブラウザによってe.dataがひらがなだったり漢字だったり違うので
+    // input欄の現在の値も併用
+    if (e.data) {
+      lastCompositionDataRef.current = e.data;
+    }
+  }
+
+  function handleCompositionEnd(e) {
+    composingRef.current = false;
+    // composition終了時のe.dataは変換後文字(漢字)のことが多いので使えない
+    // 代わりにcomposition中に記録した最新のひらがなを使う
+    let composed = lastCompositionDataRef.current;
+    // それも空なら、e.dataから取得を試みる
+    if (!composed && e.data) {
+      composed = e.data;
+    }
+
+    if (composed && onYomiHint) {
+      // ひらがな or カタカナだけなら採用
+      const isAllKana = /^[\u3040-\u309f\u30a0-\u30ff\u30fc\s・ー]+$/.test(composed);
+      if (isAllKana) {
+        // カタカナ→ひらがな変換
+        const yomi = composed.replace(/[\u30a1-\u30f6]/g, (c) =>
+          String.fromCharCode(c.charCodeAt(0) - 0x60)
+        );
+        onYomiHint(yomi);
+      }
+    }
+    lastCompositionDataRef.current = "";
+  }
+
+  function handleChange(e) {
+    const newValue = e.target.value;
+    // composition中じゃない時の入力(直接ひらがな貼り付け、削除など)
+    // ひらがな or カタカナだけ入力されたら、それもyomiヒントに
+    if (!composingRef.current && onYomiHint && newValue) {
+      const trimmed = newValue.trim();
+      if (trimmed) {
+        const isAllKana = /^[\u3040-\u309f\u30a0-\u30ff\u30fc\s・ー]+$/.test(trimmed);
+        if (isAllKana) {
+          const yomi = trimmed.replace(/[\u30a1-\u30f6]/g, (c) =>
+            String.fromCharCode(c.charCodeAt(0) - 0x60)
+          );
+          onYomiHint(yomi);
+        }
+      }
+    }
+    lastValueRef.current = newValue;
+    onChange && onChange(e);
+  }
+
+  return (
+    <input
+      {...rest}
+      value={value}
+      onChange={handleChange}
+      onCompositionStart={handleCompositionStart}
+      onCompositionUpdate={handleCompositionUpdate}
+      onCompositionEnd={handleCompositionEnd}
+    />
+  );
+}
+
 function blankRoom() {
   return {
     courts: 2,
@@ -2351,10 +2436,19 @@ function JoinNew({ ctx }) {
   const dupe = name.trim() && taken.has(name.trim().toLowerCase());
 
   // 名前変更時、自動ふりがな(手動編集中じゃなければ)
+  // ただし、漢字変換などで autoYomi が空文字を返す時は既存のyomiを保持
   useEffect(() => {
     if (!yomiManual) {
       const auto = autoYomi(name);
-      setYomi(auto);
+      // ひらがな/カタカナ入力なら自動でふりがな反映
+      // 漢字の場合は既存のyomi(composition で入ったかも)を維持
+      if (auto) {
+        setYomi(auto);
+      } else if (!name.trim()) {
+        // 名前が空になったらyomiも空に
+        setYomi("");
+      }
+      // それ以外(漢字入力)はyomiをそのまま維持
     }
   }, [name, yomiManual]);
 
@@ -2498,7 +2592,7 @@ function JoinNew({ ctx }) {
           全員に表示される表示名です
         </div>
 
-        <input
+        <NameInput
           style={{
             width: "100%",
             padding: "16px 18px",
@@ -2514,6 +2608,12 @@ function JoinNew({ ctx }) {
           placeholder="例: 田中"
           value={name}
           onChange={(e) => setName(e.target.value)}
+          onYomiHint={(yomi) => {
+            // 手動編集中じゃなければ、変換前のひらがなを使う
+            if (!yomiManual && yomi) {
+              setYomi(yomi);
+            }
+          }}
           onKeyDown={(e) => e.key === "Enter" && !showYomi && join()}
           autoFocus
         />
@@ -4910,13 +5010,19 @@ function MembersPanel({ allMembers, getMemberHistory, onRenameCurrent, onRenameP
   // 編集中の名前変更でふりがな自動更新
   useEffect(() => {
     if (inlineEditName && !editYomiManual) {
-      setEditYomiDraft(autoYomi(editNameDraft));
+      const auto = autoYomi(editNameDraft);
+      if (auto) setEditYomiDraft(auto);
+      else if (!editNameDraft.trim()) setEditYomiDraft("");
     }
   }, [editNameDraft, editYomiManual, inlineEditName]);
 
   // 追加フォームのふりがな自動更新
   useEffect(() => {
-    if (!newYomiManual) setNewYomi(autoYomi(newName));
+    if (!newYomiManual) {
+      const auto = autoYomi(newName);
+      if (auto) setNewYomi(auto);
+      else if (!newName.trim()) setNewYomi("");
+    }
   }, [newName, newYomiManual]);
 
   function handleRegister() {
@@ -5087,7 +5193,7 @@ function MembersPanel({ allMembers, getMemberHistory, onRenameCurrent, onRenameP
           >
             ＋ 新規登録
           </div>
-          <input
+          <NameInput
             style={{
               width: "100%",
               padding: "11px 14px",
@@ -5101,6 +5207,9 @@ function MembersPanel({ allMembers, getMemberHistory, onRenameCurrent, onRenameP
             placeholder="名前(例: 田中)"
             value={newName}
             onChange={(e) => setNewName(e.target.value)}
+            onYomiHint={(y) => {
+              if (!newYomiManual && y) setNewYomi(y);
+            }}
             autoFocus
             onKeyDown={(e) => e.key === "Enter" && !newYomiVisible && handleRegister()}
           />
@@ -5326,7 +5435,7 @@ function MembersPanel({ allMembers, getMemberHistory, onRenameCurrent, onRenameP
                       >
                         編集中
                       </div>
-                      <input
+                      <NameInput
                         style={{
                           width: "100%",
                           padding: "9px 12px",
@@ -5340,6 +5449,9 @@ function MembersPanel({ allMembers, getMemberHistory, onRenameCurrent, onRenameP
                         placeholder="名前"
                         value={editNameDraft}
                         onChange={(e) => setEditNameDraft(e.target.value)}
+                        onYomiHint={(y) => {
+                          if (!editYomiManual && y) setEditYomiDraft(y);
+                        }}
                         autoFocus
                       />
                       <input
@@ -5498,7 +5610,11 @@ function MemberDetail({ member, history, onBack, onRename, onDeleteFromHistory, 
   const [yomiManual, setYomiManual] = useState(!!member.yomi);
 
   useEffect(() => {
-    if (!yomiManual) setYomiDraft(autoYomi(nameDraft));
+    if (!yomiManual) {
+      const auto = autoYomi(nameDraft);
+      if (auto) setYomiDraft(auto);
+      else if (!nameDraft.trim()) setYomiDraft("");
+    }
   }, [nameDraft, yomiManual]);
 
   // 全期間の合計
@@ -5553,9 +5669,12 @@ function MemberDetail({ member, history, onBack, onRename, onDeleteFromHistory, 
         </div>
         {editMode ? (
           <div style={{ marginBottom: 4 }}>
-            <input
+            <NameInput
               value={nameDraft}
               onChange={(e) => setNameDraft(e.target.value)}
+              onYomiHint={(y) => {
+                if (!yomiManual && y) setYomiDraft(y);
+              }}
               style={{
                 width: "100%",
                 background: "rgba(255,255,255,.1)",
@@ -5855,13 +5974,20 @@ function APlayers({ players, playCount, onAdd, onRemove, onRename, restingIds, o
 
   // 名前変更時、自動でふりがな(手動編集中じゃなければ)
   useEffect(() => {
-    if (!yomiManual) setYomi(autoYomi(name));
+    if (!yomiManual) {
+      const auto = autoYomi(name);
+      if (auto) setYomi(auto);
+      else if (!name.trim()) setYomi("");
+      // 漢字入力時はyomi維持
+    }
   }, [name, yomiManual]);
 
   // 編集モード時の自動ふりがな
   useEffect(() => {
     if (editId && !editYomiManual) {
-      setEditYomi(autoYomi(editName));
+      const auto = autoYomi(editName);
+      if (auto) setEditYomi(auto);
+      else if (!editName.trim()) setEditYomi("");
     }
   }, [editName, editYomiManual, editId]);
 
@@ -5909,7 +6035,7 @@ function APlayers({ players, playCount, onAdd, onRemove, onRename, restingIds, o
   return (
     <div>
       <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
-        <input
+        <NameInput
           style={{
             flex: 1,
             padding: "13px 14px",
@@ -5923,6 +6049,9 @@ function APlayers({ players, playCount, onAdd, onRemove, onRename, restingIds, o
           placeholder="名前を入力 → Enter"
           value={name}
           onChange={(e) => setName(e.target.value)}
+          onYomiHint={(y) => {
+            if (!yomiManual && y) setYomi(y);
+          }}
           onKeyDown={(e) => e.key === "Enter" && !showYomi && add()}
         />
         <button
@@ -6017,7 +6146,7 @@ function APlayers({ players, playCount, onAdd, onRemove, onRename, restingIds, o
                     >
                       編集中
                     </div>
-                    <input
+                    <NameInput
                       style={{
                         width: "100%",
                         padding: "10px 12px",
@@ -6031,6 +6160,9 @@ function APlayers({ players, playCount, onAdd, onRemove, onRename, restingIds, o
                       placeholder="名前"
                       value={editName}
                       onChange={(e) => setEditName(e.target.value)}
+                      onYomiHint={(y) => {
+                        if (!editYomiManual && y) setEditYomi(y);
+                      }}
                       autoFocus
                     />
                     <input
@@ -6804,7 +6936,6 @@ function exportSessionPDF(session, playCount, ranked, dateStr) {
 ${_("style")}
 ${_("head")}
 <body>
-<button class="no-print" onclick="window.print()">🖨 印刷 / PDFで保存</button>
 <div class="container">
   <div class="hero">
     <div class="eye">Genki.B.C · Session Result</div>
@@ -6826,22 +6957,10 @@ ${_("head")}
 
   <div class="footer">Generated by Genki.B.C Badminton Manager · ${new Date().toLocaleDateString("ja-JP")}${_("div")}
 ${_("div")}
-<` + `script>
-  // 印刷ダイアログを自動で開く(モバイル除く)
-  setTimeout(() => { try { window.print(); } catch (e) {} }, 400);
-</` + `script>
 ${_("body")}
 ${_("html")}`;
 
-  // 新しいウィンドウで開く
-  const w = window.open("", "_blank");
-  if (!w) {
-    alert("ポップアップがブロックされました。ブラウザの設定でポップアップを許可してください。");
-    return;
-  }
-  w.document.open();
-  w.document.write(html);
-  w.document.close();
+  return html;
 }
 
 function escapeHtml(str) {
@@ -6852,6 +6971,178 @@ function escapeHtml(str) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+}
+
+// ── PDFプレビューモーダル ──
+// iframeで結果ページをプレビュー表示
+// ・×ボタンで閉じる
+// ・印刷ボタンでブラウザの印刷ダイアログ
+// ・背景タップでも閉じる
+function PDFPreviewModal({ session, playCount, ranked, dateStr, onClose }) {
+  const iframeRef = useRef(null);
+
+  // iframe の中に PDF HTML を流し込む
+  useEffect(() => {
+    if (!iframeRef.current) return;
+    const html = exportSessionPDF(session, playCount, ranked, dateStr);
+    const doc = iframeRef.current.contentDocument || iframeRef.current.contentWindow.document;
+    doc.open();
+    doc.write(html);
+    doc.close();
+  }, [session, playCount, ranked, dateStr]);
+
+  function handlePrint() {
+    try {
+      if (iframeRef.current && iframeRef.current.contentWindow) {
+        iframeRef.current.contentWindow.focus();
+        iframeRef.current.contentWindow.print();
+      }
+    } catch (e) {
+      alert("印刷に失敗しました: " + e.message);
+    }
+  }
+
+  // ESCキーで閉じる
+  useEffect(() => {
+    function onKey(e) {
+      if (e.key === "Escape") onClose();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(15,22,18,.85)",
+        zIndex: 1000,
+        display: "flex",
+        flexDirection: "column",
+      }}
+      onClick={onClose}
+    >
+      {/* ヘッダー(×ボタンと印刷ボタン) */}
+      <div
+        style={{
+          background: T.bgDark,
+          color: T.surface,
+          padding: "12px 16px",
+          display: "flex",
+          alignItems: "center",
+          gap: 10,
+          flexShrink: 0,
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <button
+          onClick={onClose}
+          style={{
+            background: "rgba(255,255,255,.1)",
+            border: "1px solid rgba(255,255,255,.2)",
+            color: T.surface,
+            width: 36,
+            height: 36,
+            borderRadius: 10,
+            fontSize: 18,
+            fontWeight: 700,
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            flexShrink: 0,
+          }}
+          aria-label="閉じる"
+        >
+          ×
+        </button>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div
+            className="mono"
+            style={{
+              fontSize: 9,
+              letterSpacing: ".15em",
+              color: T.accent,
+              textTransform: "uppercase",
+              fontWeight: 700,
+            }}
+          >
+            PDF Preview
+          </div>
+          <div
+            style={{
+              fontSize: 14,
+              fontWeight: 700,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {session.name}
+          </div>
+        </div>
+        <button
+          onClick={handlePrint}
+          style={{
+            padding: "10px 14px",
+            background: T.primary,
+            border: "none",
+            borderRadius: 10,
+            color: T.surface,
+            fontSize: 12,
+            fontWeight: 700,
+            cursor: "pointer",
+            flexShrink: 0,
+            boxShadow: "0 2px 8px rgba(10,135,84,.4)",
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+          }}
+        >
+          🖨 印刷 / PDF保存
+        </button>
+      </div>
+
+      {/* iframe コンテンツ */}
+      <div
+        style={{
+          flex: 1,
+          background: "#fff",
+          margin: "12px",
+          borderRadius: 10,
+          overflow: "hidden",
+          boxShadow: "0 10px 40px rgba(0,0,0,.4)",
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <iframe
+          ref={iframeRef}
+          style={{
+            width: "100%",
+            height: "100%",
+            border: "none",
+            display: "block",
+          }}
+          title="PDF Preview"
+        />
+      </div>
+
+      {/* フッターヒント */}
+      <div
+        style={{
+          padding: "8px 16px 12px",
+          textAlign: "center",
+          color: "rgba(255,255,255,.6)",
+          fontSize: 11,
+          flexShrink: 0,
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        💡 印刷ダイアログで「PDFとして保存」を選ぶとPDFが保存できます · 背景タップ or ESC で閉じる
+      </div>
+    </div>
+  );
 }
 
 // ── セッション詳細 ──
@@ -6903,6 +7194,15 @@ function SessionDetailView({ session, onBack, onDelete, onRename, onEditMatch, o
 
   return (
     <div>
+      {showPdf && (
+        <PDFPreviewModal
+          session={session}
+          playCount={playCount}
+          ranked={ranked}
+          dateStr={dateStr}
+          onClose={() => setShowPdf(false)}
+        />
+      )}
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
         <button
           onClick={onBack}
@@ -6918,7 +7218,7 @@ function SessionDetailView({ session, onBack, onDelete, onRename, onEditMatch, o
           ← 履歴一覧に戻る
         </button>
         <button
-          onClick={() => exportSessionPDF(session, playCount, ranked, dateStr)}
+          onClick={() => setShowPdf(true)}
           style={{
             padding: "6px 12px",
             background: T.surface,
