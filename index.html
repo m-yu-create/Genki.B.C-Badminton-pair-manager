@@ -82,6 +82,60 @@ function getDB() {
   return _db;
 }
 
+// ────────────────────────────────────────────
+// 名前から自動でふりがなを推定
+// ・ひらがな → そのまま
+// ・カタカナ → ひらがなに変換
+// ・漢字混じり / 英字 → null(管理者が手動で入力)
+// ────────────────────────────────────────────
+function autoYomi(name) {
+  if (!name) return "";
+  const trimmed = name.trim();
+  // 含まれる文字が全部ひらがな or カタカナか
+  const isAllKana = /^[\u3040-\u309f\u30a0-\u30ff\u30fc\s・ー]+$/.test(trimmed);
+  if (!isAllKana) return ""; // 漢字や英字を含む → 自動取得不可
+  // カタカナ→ひらがな変換
+  return trimmed.replace(/[\u30a1-\u30f6]/g, (c) =>
+    String.fromCharCode(c.charCodeAt(0) - 0x60)
+  );
+}
+
+// ふりがな順ソート用キーを生成
+// ふりがながあればそれ、なければ名前そのもの
+function yomiSortKey(player) {
+  const y = (player.yomi || "").trim();
+  if (y) return y;
+  // ふりがな未設定の人は、自動取得を試す
+  const auto = autoYomi(player.name);
+  if (auto) return auto;
+  // それでも取れない場合は、名前を使う(ソート末尾に来る)
+  return "~" + (player.name || "");
+}
+
+// ふりがなの頭文字から五十音インデックスを取得("あ", "か", "さ"...)
+function yomiInitial(player) {
+  const key = yomiSortKey(player);
+  const first = key.charAt(0);
+  if (!first) return "他";
+  // ひらがなの行を判定
+  const groups = [
+    ["あ", /^[あいうえおぁぃぅぇぉ]/],
+    ["か", /^[かきくけこがぎぐげごゕゖ]/],
+    ["さ", /^[さしすせそざじずぜぞ]/],
+    ["た", /^[たちつてとだぢづでどっ]/],
+    ["な", /^[なにぬねの]/],
+    ["は", /^[はひふへほばびぶべぼぱぴぷぺぽ]/],
+    ["ま", /^[まみむめも]/],
+    ["や", /^[やゆよゃゅょ]/],
+    ["ら", /^[らりるれろ]/],
+    ["わ", /^[わをんゐゑ]/],
+  ];
+  for (const [label, re] of groups) {
+    if (re.test(first)) return label;
+  }
+  return "他";
+}
+
 function blankRoom() {
   return {
     courts: 2,
@@ -581,13 +635,137 @@ function App() {
   const waiting = d.waiting || [];
   const myPlayer = players.find((p) => p.id === myId) || null;
 
-  function addPlayer(name) {
+  function addPlayer(name, yomi = "") {
     const id = gid();
-    const newPlayer = { id, name: name.trim(), wins: 0, losses: 0 };
+    const newPlayer = {
+      id,
+      name: name.trim(),
+      yomi: (yomi || autoYomi(name)).trim(),
+      wins: 0,
+      losses: 0,
+    };
     upd((p) => ({ ...p, players: [...p.players, newPlayer] }));
     setMyId(id);
     showToast(`${name.trim()} として参加`);
     return id;
+  }
+
+  // 過去に参加したことのある人(現セッションにいない)のリストを取得
+  // ふりがな順でソート、五十音グループ別に
+  function getPastPlayers() {
+    const currentNames = new Set(players.map((p) => p.name));
+    const seen = new Map(); // name -> {name, yomi, lastSeen, attendances}
+
+    (d.savedSessions || []).forEach((s) => {
+      (s.players || []).forEach((p) => {
+        // 現在参加中の人はスキップ
+        if (currentNames.has(p.name)) return;
+        const key = p.name;
+        if (!seen.has(key)) {
+          seen.set(key, {
+            name: p.name,
+            yomi: p.yomi || autoYomi(p.name),
+            lastSeen: s.endedAt || 0,
+            attendances: 1,
+          });
+        } else {
+          const existing = seen.get(key);
+          existing.attendances += 1;
+          existing.lastSeen = Math.max(existing.lastSeen, s.endedAt || 0);
+          // yomi が空なら、保存版から取り直す
+          if (!existing.yomi && p.yomi) existing.yomi = p.yomi;
+        }
+      });
+    });
+
+    return Array.from(seen.values()).sort((a, b) =>
+      yomiSortKey(a).localeCompare(yomiSortKey(b), "ja")
+    );
+  }
+
+  // 過去参加者を再度参加させる(同じ名前・ふりがなで)
+  function joinAsPastPlayer(pastPlayer) {
+    // 同名の人がすでに現セッションにいないか確認
+    const exists = players.some((p) => p.name === pastPlayer.name);
+    if (exists) {
+      showToast(`${pastPlayer.name} はすでに参加しています`);
+      // すでにいる人をmyIdに
+      const ex = players.find((p) => p.name === pastPlayer.name);
+      if (ex) setMyId(ex.id);
+      return;
+    }
+    return addPlayer(pastPlayer.name, pastPlayer.yomi || "");
+  }
+
+  // 参加者の名前(とふりがな)を変更し、過去データも全部連動更新
+  function renamePlayer(playerId, newName, newYomi) {
+    const player = players.find((p) => p.id === playerId);
+    if (!player) return;
+    const trimmedName = (newName || "").trim();
+    if (!trimmedName) {
+      showToast("名前を入力してください");
+      return;
+    }
+    const trimmedYomi = (newYomi || "").trim();
+    const oldName = player.name;
+
+    upd((p) => ({
+      ...p,
+      // 現参加者リスト
+      players: p.players.map((x) =>
+        x.id === playerId ? { ...x, name: trimmedName, yomi: trimmedYomi } : x
+      ),
+      // 進行中試合
+      matches: p.matches.map((m) => ({
+        ...m,
+        team1: m.team1.map((x) =>
+          x.id === playerId ? { ...x, name: trimmedName } : x
+        ),
+        team2: m.team2.map((x) =>
+          x.id === playerId ? { ...x, name: trimmedName } : x
+        ),
+      })),
+      // 待機リスト
+      waiting: p.waiting.map((x) =>
+        x.id === playerId ? { ...x, name: trimmedName } : x
+      ),
+      // 試合履歴(現セッション)
+      history: p.history.map((h) => ({
+        ...h,
+        team1: h.team1.map((x) =>
+          x.id === playerId ? { ...x, name: trimmedName } : x
+        ),
+        team2: h.team2.map((x) =>
+          x.id === playerId ? { ...x, name: trimmedName } : x
+        ),
+      })),
+      // 過去セッションのデータも、名前で照合して更新
+      // (idが変わってる可能性もあるので名前ベース)
+      savedSessions: (p.savedSessions || []).map((s) => ({
+        ...s,
+        players: (s.players || []).map((pp) =>
+          pp.name === oldName
+            ? { ...pp, name: trimmedName, yomi: trimmedYomi }
+            : pp
+        ),
+        history: (s.history || []).map((h) => ({
+          ...h,
+          team1: h.team1.map((x) =>
+            x.name === oldName ? { ...x, name: trimmedName } : x
+          ),
+          team2: h.team2.map((x) =>
+            x.name === oldName ? { ...x, name: trimmedName } : x
+          ),
+        })),
+      })),
+      attendanceLog: (p.attendanceLog || []).map((a) => ({
+        ...a,
+        playerNames: (a.playerNames || []).map((n) =>
+          n === oldName ? trimmedName : n
+        ),
+      })),
+    }));
+    showToast(`「${oldName}」を「${trimmedName}」に変更`);
   }
 
   function removePlayer(pid) {
@@ -1157,7 +1335,10 @@ function App() {
     upd,
     showToast,
     addPlayer,
+    renamePlayer,
     removePlayer,
+    getPastPlayers,
+    joinAsPastPlayer,
     startMatches,
     regenMatches,
     finishMatch,
@@ -1268,6 +1449,8 @@ function App() {
         {mode === "join_new" && <JoinNew ctx={ctx} />}
         {mode === "join_select" && <JoinSelect ctx={ctx} />}
         {mode === "status" && <Status ctx={ctx} />}
+        {mode === "share" && !IS_PLAYER_VIEW && <SharePanel ctx={ctx} />}
+        {mode === "share" && IS_PLAYER_VIEW && <Home ctx={ctx} />}
         {mode === "admin" && !IS_PLAYER_VIEW && <Admin ctx={ctx} />}
         {mode === "admin" && IS_PLAYER_VIEW && <Home ctx={ctx} />}
         {mode === "qr_join" && <QrJoin ctx={ctx} />}
@@ -1384,13 +1567,22 @@ function Home({ ctx }) {
           live={matches.length > 0}
         />
         {!IS_PLAYER_VIEW && (
-          <MenuBtn
-            variant="quiet"
-            icon={<IconSettings />}
-            label="管理者画面"
-            sub="参加者の追加・試合の開始"
-            onClick={() => setMode("admin")}
-          />
+          <>
+            <MenuBtn
+              variant="quiet"
+              icon={<IconShare />}
+              label="URL共有"
+              sub="参加者用URLをコピー・共有"
+              onClick={() => setMode("share")}
+            />
+            <MenuBtn
+              variant="quiet"
+              icon={<IconSettings />}
+              label="管理者画面"
+              sub="参加者の追加・試合の開始"
+              onClick={() => setMode("admin")}
+            />
+          </>
         )}
       </div>
 
@@ -1612,19 +1804,304 @@ function MenuBtn({ variant, icon, label, sub, onClick, live }) {
 }
 
 // ═══════════════════════════════════════════════════════════
+// SHARE PANEL — URL共有画面
+// ═══════════════════════════════════════════════════════════
+function SharePanel({ ctx }) {
+  const { setMode, showToast } = ctx;
+  const [copied, setCopied] = useState(null); // どのボタンがコピーしたか
+
+  // 現在のURLから管理者用/参加者用を組み立てる
+  const adminUrl = (() => {
+    try {
+      const u = new URL(window.location.href);
+      u.searchParams.delete("view");
+      u.searchParams.delete("join");
+      // hash & 余計なpathは削除
+      u.hash = "";
+      return u.toString().replace(/\?$/, "");
+    } catch (e) {
+      return window.location.origin + window.location.pathname;
+    }
+  })();
+  const playerUrl = (() => {
+    try {
+      const u = new URL(window.location.href);
+      u.searchParams.set("view", "player");
+      u.searchParams.delete("join");
+      u.hash = "";
+      return u.toString();
+    } catch (e) {
+      return adminUrl + "?view=player";
+    }
+  })();
+
+  // 共有メッセージ
+  const shareMessage = `管理者url：
+${adminUrl}
+
+-----------------
+
+参加者url
+${playerUrl}
+
+基本的に松戸で、参加者登録してます。
+試合状況の確認、試合結果の登録をお願いします。`;
+
+  async function copyToClipboard(text, label) {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        // フォールバック: 古いブラウザ向け
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+      }
+      setCopied(label);
+      showToast(`${label} をコピーしました`);
+      setTimeout(() => setCopied(null), 1500);
+    } catch (e) {
+      showToast("コピーに失敗しました");
+    }
+  }
+
+  return (
+    <div style={{ minHeight: "100vh", padding: "20px 20px 60px" }}>
+      <Back onClick={() => setMode("home")} />
+      <div style={{ maxWidth: 540, margin: "12px auto 0" }}>
+        <div
+          className="mono"
+          style={{
+            fontSize: 11,
+            letterSpacing: ".22em",
+            color: T.primary,
+            marginBottom: 10,
+            textTransform: "uppercase",
+            fontWeight: 700,
+          }}
+        >
+          URL Share
+        </div>
+        <div
+          style={{
+            fontSize: 26,
+            fontWeight: 900,
+            letterSpacing: "-.02em",
+            marginBottom: 6,
+            lineHeight: 1.2,
+          }}
+        >
+          URL共有
+        </div>
+        <div style={{ color: T.inkSoft, fontSize: 13, marginBottom: 24, lineHeight: 1.6 }}>
+          LINEなどで参加者に送る用のURLとメッセージです。<br />
+          下のボタンをタップしてコピーしてください。
+        </div>
+
+        {/* 管理者URL */}
+        <SectionTitle>管理者URL</SectionTitle>
+        <div
+          style={{
+            background: T.surface,
+            border: `1px solid ${T.line}`,
+            borderRadius: 12,
+            padding: 14,
+            marginBottom: 16,
+          }}
+        >
+          <div
+            className="mono"
+            style={{
+              fontSize: 11,
+              color: T.inkSoft,
+              wordBreak: "break-all",
+              padding: "10px 12px",
+              background: T.surfaceWarm,
+              borderRadius: 8,
+              marginBottom: 10,
+              lineHeight: 1.5,
+              border: `1px solid ${T.lineSoft}`,
+            }}
+          >
+            {adminUrl}
+          </div>
+          <button
+            onClick={() => copyToClipboard(adminUrl, "管理者URL")}
+            style={{
+              width: "100%",
+              padding: "10px",
+              background: copied === "管理者URL" ? T.primary : T.surface,
+              border: `1.5px solid ${T.primary}`,
+              borderRadius: 10,
+              color: copied === "管理者URL" ? T.surface : T.primary,
+              fontSize: 13,
+              fontWeight: 700,
+              transition: "all .15s",
+            }}
+          >
+            {copied === "管理者URL" ? "✓ コピーしました" : "📋 タップしてコピー"}
+          </button>
+          <div style={{ fontSize: 11, color: T.danger, marginTop: 6, paddingLeft: 4, lineHeight: 1.5 }}>
+            ⚠ このURLは自分用です。参加者に教えないでください
+          </div>
+        </div>
+
+        {/* 参加者URL */}
+        <SectionTitle>参加者URL</SectionTitle>
+        <div
+          style={{
+            background: T.surface,
+            border: `1px solid ${T.line}`,
+            borderRadius: 12,
+            padding: 14,
+            marginBottom: 16,
+          }}
+        >
+          <div
+            className="mono"
+            style={{
+              fontSize: 11,
+              color: T.inkSoft,
+              wordBreak: "break-all",
+              padding: "10px 12px",
+              background: T.surfaceWarm,
+              borderRadius: 8,
+              marginBottom: 10,
+              lineHeight: 1.5,
+              border: `1px solid ${T.lineSoft}`,
+            }}
+          >
+            {playerUrl}
+          </div>
+          <button
+            onClick={() => copyToClipboard(playerUrl, "参加者URL")}
+            style={{
+              width: "100%",
+              padding: "10px",
+              background: copied === "参加者URL" ? T.primary : T.surface,
+              border: `1.5px solid ${T.primary}`,
+              borderRadius: 10,
+              color: copied === "参加者URL" ? T.surface : T.primary,
+              fontSize: 13,
+              fontWeight: 700,
+              transition: "all .15s",
+            }}
+          >
+            {copied === "参加者URL" ? "✓ コピーしました" : "📋 タップしてコピー"}
+          </button>
+          <div style={{ fontSize: 11, color: T.inkSoft, marginTop: 6, paddingLeft: 4, lineHeight: 1.5 }}>
+            参加者にはこちらを送ってください
+          </div>
+        </div>
+
+        {/* 共有用メッセージ */}
+        <SectionTitle>送信用メッセージ(おすすめ)</SectionTitle>
+        <div
+          style={{
+            background: T.surface,
+            border: `1px solid ${T.line}`,
+            borderRadius: 12,
+            padding: 14,
+            marginBottom: 16,
+          }}
+        >
+          <div style={{ fontSize: 11, color: T.inkSoft, marginBottom: 8, lineHeight: 1.5 }}>
+            LINEグループなどへの送信用にまとまったテキスト。これごとコピーOKです。
+          </div>
+          <pre
+            style={{
+              fontSize: 11,
+              color: T.ink,
+              padding: "12px 14px",
+              background: T.surfaceWarm,
+              borderRadius: 8,
+              marginBottom: 10,
+              lineHeight: 1.6,
+              border: `1px solid ${T.lineSoft}`,
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-all",
+              fontFamily: "inherit",
+              maxHeight: 260,
+              overflow: "auto",
+              margin: "0 0 10px 0",
+            }}
+          >
+            {shareMessage}
+          </pre>
+          <button
+            onClick={() => copyToClipboard(shareMessage, "メッセージ")}
+            style={{
+              width: "100%",
+              padding: "12px",
+              background: copied === "メッセージ" ? T.primary : T.primary,
+              border: "none",
+              borderRadius: 11,
+              color: T.surface,
+              fontSize: 14,
+              fontWeight: 700,
+              boxShadow: `0 4px 14px rgba(10,135,84,.25)`,
+            }}
+          >
+            {copied === "メッセージ" ? "✓ コピーしました" : "📋 メッセージごとコピー"}
+          </button>
+        </div>
+
+        <div
+          style={{
+            background: T.surfaceWarm,
+            borderRadius: 10,
+            padding: 12,
+            fontSize: 11,
+            color: T.inkSoft,
+            lineHeight: 1.6,
+          }}
+        >
+          💡 コピーしたら、LINE・メール・メモなどに貼り付けて使ってください。
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════
 // JOIN NEW
 // ═══════════════════════════════════════════════════════════
 function JoinNew({ ctx }) {
-  const { players, addPlayer, setMode } = ctx;
+  const { players, addPlayer, getPastPlayers, joinAsPastPlayer, setMode } = ctx;
   const [name, setName] = useState("");
+  const [yomi, setYomi] = useState("");
+  const [yomiManual, setYomiManual] = useState(false); // 手動編集モード
   const [done, setDone] = useState(false);
+  const [showYomi, setShowYomi] = useState(false);
 
   const taken = new Set(players.map((p) => p.name.toLowerCase()));
   const dupe = name.trim() && taken.has(name.trim().toLowerCase());
 
+  // 名前変更時、自動ふりがな(手動編集中じゃなければ)
+  useEffect(() => {
+    if (!yomiManual) {
+      const auto = autoYomi(name);
+      setYomi(auto);
+    }
+  }, [name, yomiManual]);
+
+  // 過去参加者(現在不在の人)
+  const pastPlayers = getPastPlayers();
+
   function join() {
     if (!name.trim() || dupe) return;
-    addPlayer(name.trim());
+    addPlayer(name.trim(), yomi.trim());
+    setDone(true);
+  }
+
+  function joinPast(p) {
+    joinAsPastPlayer(p);
+    setName(p.name);
     setDone(true);
   }
 
@@ -1710,6 +2187,18 @@ function JoinNew({ ctx }) {
     );
   }
 
+  // 過去参加者を五十音グループに分ける
+  const groupedPast = {};
+  pastPlayers.forEach((p) => {
+    const initial = yomiInitial(p);
+    if (!groupedPast[initial]) groupedPast[initial] = [];
+    groupedPast[initial].push(p);
+  });
+  const groupOrder = ["あ", "か", "さ", "た", "な", "は", "ま", "や", "ら", "わ", "他"];
+
+  // 同名チェック(過去参加者と被ってる時の警告用)
+  const sameNamePast = name.trim() && pastPlayers.some((p) => p.name === name.trim());
+
   return (
     <div style={{ minHeight: "100vh", padding: "20px 20px 60px" }}>
       <Back onClick={() => setMode("home")} />
@@ -1750,24 +2239,206 @@ function JoinNew({ ctx }) {
             background: T.surface,
             color: T.ink,
             fontSize: 16,
-            marginBottom: dupe ? 8 : 16,
+            marginBottom: dupe ? 8 : 12,
             transition: "border-color .15s",
             fontWeight: 500,
           }}
           placeholder="例: 田中"
           value={name}
           onChange={(e) => setName(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && join()}
+          onKeyDown={(e) => e.key === "Enter" && !showYomi && join()}
           autoFocus
         />
         {dupe && (
-          <div style={{ color: T.danger, fontSize: 12, marginBottom: 16, paddingLeft: 4 }}>
+          <div style={{ color: T.danger, fontSize: 12, marginBottom: 12, paddingLeft: 4 }}>
             この名前は既に使われています
           </div>
         )}
+        {sameNamePast && !dupe && (
+          <div
+            style={{
+              background: T.warnSoft,
+              border: `1px solid ${T.warn}`,
+              borderRadius: 10,
+              padding: "8px 12px",
+              fontSize: 12,
+              color: T.warn,
+              marginBottom: 12,
+              lineHeight: 1.5,
+            }}
+          >
+            ⚠ 過去に同じ名前の方がいます。同じ方なら下のリストから選択。<br />
+            別の方なら、ふりがなや名前で区別してください。
+          </div>
+        )}
+
+        {/* ふりがな入力(任意) */}
+        {!showYomi ? (
+          <button
+            onClick={() => setShowYomi(true)}
+            style={{
+              width: "100%",
+              padding: "10px",
+              background: "transparent",
+              border: `1px dashed ${T.line}`,
+              borderRadius: 10,
+              color: T.inkSoft,
+              fontSize: 12,
+              marginBottom: 16,
+              fontWeight: 500,
+            }}
+          >
+            {yomi ? `ふりがな: ${yomi} (タップで編集)` : "+ ふりがなを追加 (任意)"}
+          </button>
+        ) : (
+          <div style={{ marginBottom: 16 }}>
+            <div
+              className="mono"
+              style={{
+                fontSize: 10,
+                letterSpacing: ".1em",
+                color: T.inkSoft,
+                marginBottom: 4,
+                textTransform: "uppercase",
+              }}
+            >
+              ふりがな(任意)
+            </div>
+            <input
+              style={{
+                width: "100%",
+                padding: "12px 16px",
+                borderRadius: 12,
+                border: `1.5px solid ${T.line}`,
+                background: T.surface,
+                color: T.ink,
+                fontSize: 14,
+                fontWeight: 500,
+              }}
+              placeholder="例: たなか"
+              value={yomi}
+              onChange={(e) => {
+                setYomi(e.target.value);
+                setYomiManual(true);
+              }}
+              onKeyDown={(e) => e.key === "Enter" && join()}
+            />
+            <div style={{ fontSize: 10, color: T.inkSoft, marginTop: 4, paddingLeft: 4 }}>
+              五十音順の並び替えに使われます
+            </div>
+          </div>
+        )}
+
         <Btn disabled={!name.trim() || dupe} onClick={join}>
           参加する
         </Btn>
+
+        {/* 過去参加者リスト(五十音順) */}
+        {pastPlayers.length > 0 && (
+          <div style={{ marginTop: 32 }}>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                marginBottom: 14,
+                paddingBottom: 10,
+                borderBottom: `1.5px solid ${T.ink}`,
+              }}
+            >
+              <div
+                className="mono"
+                style={{
+                  fontSize: 10,
+                  letterSpacing: ".22em",
+                  color: T.primary,
+                  textTransform: "uppercase",
+                  fontWeight: 700,
+                }}
+              >
+                Past Players
+              </div>
+              <div style={{ flex: 1 }} />
+              <div
+                className="mono"
+                style={{ fontSize: 11, color: T.inkSoft }}
+              >
+                {pastPlayers.length}人
+              </div>
+            </div>
+            <div style={{ fontSize: 12, color: T.inkSoft, marginBottom: 14, lineHeight: 1.6 }}>
+              前回までに参加した方は、タップで再参加できます (五十音順)
+            </div>
+
+            {groupOrder.map((g) => {
+              const group = groupedPast[g];
+              if (!group || group.length === 0) return null;
+              return (
+                <div key={g} style={{ marginBottom: 14 }}>
+                  <div
+                    style={{
+                      fontSize: 12,
+                      fontWeight: 700,
+                      color: T.primary,
+                      marginBottom: 6,
+                      paddingLeft: 4,
+                    }}
+                  >
+                    {g}
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    {group.map((p) => (
+                      <button
+                        key={p.name}
+                        onClick={() => joinPast(p)}
+                        style={{
+                          width: "100%",
+                          padding: "10px 14px",
+                          background: T.surface,
+                          border: `1px solid ${T.line}`,
+                          borderRadius: 10,
+                          textAlign: "left",
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 10,
+                          cursor: "pointer",
+                        }}
+                      >
+                        <span
+                          style={{
+                            fontSize: 14,
+                            fontWeight: 600,
+                            color: T.ink,
+                          }}
+                        >
+                          {p.name}
+                        </span>
+                        {p.yomi && (
+                          <span
+                            className="mono"
+                            style={{ fontSize: 10, color: T.inkSoft }}
+                          >
+                            {p.yomi}
+                          </span>
+                        )}
+                        <div style={{ flex: 1 }} />
+                        <span
+                          style={{
+                            fontSize: 16,
+                            color: T.primary,
+                            opacity: 0.5,
+                          }}
+                        >
+                          →
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
 
         {players.length > 0 && (
           <div style={{ marginTop: 28 }}>
@@ -2129,94 +2800,149 @@ function JoinSelect({ ctx }) {
             >
               タップで状況確認・「退出」で参加取消
             </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {players.map((p, i) => {
-                const isMe = p.id === myId;
-                const pending = confirmLeave === p.id;
-                return (
-                  <div key={p.id} style={{ display: "flex", gap: 8 }}>
-                    <button
-                      onClick={() => select(p.id)}
-                      style={{
-                        flex: 1,
-                        padding: "14px 16px",
-                        background: isMe ? T.primarySoft : T.surface,
-                        border: `1.5px solid ${isMe ? T.primary : T.line}`,
-                        borderRadius: 14,
-                        textAlign: "left",
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 12,
-                      }}
-                    >
-                      <span
-                        className="mono"
-                        style={{
-                          width: 34,
-                          height: 34,
-                          borderRadius: 10,
-                          background: isMe ? T.primary : T.lineSoft,
-                          color: isMe ? T.surface : T.ink,
-                          fontSize: 13,
-                          fontWeight: 700,
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "center",
-                          flexShrink: 0,
-                        }}
-                      >
-                        {String(i + 1).padStart(2, "0")}
-                      </span>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: 15, fontWeight: 700, color: T.ink }}>
-                          {p.name}
-                        </div>
+            {(() => {
+              // 五十音グループに分けてソート
+              const sorted = [...players].sort((a, b) =>
+                yomiSortKey(a).localeCompare(yomiSortKey(b), "ja")
+              );
+              const grouped = {};
+              sorted.forEach((p) => {
+                const initial = yomiInitial(p);
+                if (!grouped[initial]) grouped[initial] = [];
+                grouped[initial].push(p);
+              });
+              const groupOrder = ["あ", "か", "さ", "た", "な", "は", "ま", "や", "ら", "わ", "他"];
+              // 元の登録番号を保持するためのマッピング
+              const originalIndex = new Map();
+              players.forEach((p, i) => originalIndex.set(p.id, i));
+
+              return (
+                <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+                  {groupOrder.map((g) => {
+                    const group = grouped[g];
+                    if (!group || group.length === 0) return null;
+                    return (
+                      <div key={g}>
                         <div
-                          className="mono"
-                          style={{ fontSize: 11, color: T.inkSoft, marginTop: 2 }}
-                        >
-                          {p.wins || 0}W · {p.losses || 0}L
-                        </div>
-                      </div>
-                      {isMe && (
-                        <span
-                          className="mono"
                           style={{
-                            fontSize: 10,
-                            color: T.primary,
+                            fontSize: 13,
                             fontWeight: 700,
-                            background: T.surface,
-                            padding: "4px 10px",
-                            borderRadius: 999,
-                            border: `1px solid ${T.primary}`,
-                            letterSpacing: ".1em",
-                            textTransform: "uppercase",
+                            color: T.primary,
+                            marginBottom: 6,
+                            paddingLeft: 4,
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 8,
                           }}
                         >
-                          選択中
-                        </span>
-                      )}
-                    </button>
-                    <button
-                      onClick={() => leave(p.id)}
-                      style={{
-                        padding: "0 14px",
-                        background: pending ? T.danger : T.dangerSoft,
-                        border: `1px solid ${pending ? T.danger : "#f5c8c4"}`,
-                        borderRadius: 12,
-                        color: pending ? T.surface : T.danger,
-                        fontSize: 12,
-                        fontWeight: 700,
-                        flexShrink: 0,
-                        minWidth: 64,
-                      }}
-                    >
-                      {pending ? "確定?" : "退出"}
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
+                          <span style={{ minWidth: 16 }}>{g}</span>
+                          <span
+                            style={{
+                              flex: 1,
+                              height: 1,
+                              background: T.lineSoft,
+                            }}
+                          />
+                          <span className="mono" style={{ fontSize: 10, color: T.inkSoft, fontWeight: 600 }}>
+                            {group.length}人
+                          </span>
+                        </div>
+                        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                          {group.map((p) => {
+                            const i = originalIndex.get(p.id);
+                            const isMe = p.id === myId;
+                            const pending = confirmLeave === p.id;
+                            return (
+                              <div key={p.id} style={{ display: "flex", gap: 8 }}>
+                                <button
+                                  onClick={() => select(p.id)}
+                                  style={{
+                                    flex: 1,
+                                    padding: "14px 16px",
+                                    background: isMe ? T.primarySoft : T.surface,
+                                    border: `1.5px solid ${isMe ? T.primary : T.line}`,
+                                    borderRadius: 14,
+                                    textAlign: "left",
+                                    display: "flex",
+                                    alignItems: "center",
+                                    gap: 12,
+                                  }}
+                                >
+                                  <span
+                                    className="mono"
+                                    style={{
+                                      width: 34,
+                                      height: 34,
+                                      borderRadius: 10,
+                                      background: isMe ? T.primary : T.lineSoft,
+                                      color: isMe ? T.surface : T.ink,
+                                      fontSize: 13,
+                                      fontWeight: 700,
+                                      display: "flex",
+                                      alignItems: "center",
+                                      justifyContent: "center",
+                                      flexShrink: 0,
+                                    }}
+                                  >
+                                    {String(i + 1).padStart(2, "0")}
+                                  </span>
+                                  <div style={{ flex: 1, minWidth: 0 }}>
+                                    <div style={{ fontSize: 15, fontWeight: 700, color: T.ink }}>
+                                      {p.name}
+                                    </div>
+                                    <div
+                                      className="mono"
+                                      style={{ fontSize: 11, color: T.inkSoft, marginTop: 2, display: "flex", gap: 8 }}
+                                    >
+                                      {p.yomi && <span>{p.yomi}</span>}
+                                      <span>{p.wins || 0}W · {p.losses || 0}L</span>
+                                    </div>
+                                  </div>
+                                  {isMe && (
+                                    <span
+                                      className="mono"
+                                      style={{
+                                        fontSize: 10,
+                                        color: T.primary,
+                                        fontWeight: 700,
+                                        background: T.surface,
+                                        padding: "4px 10px",
+                                        borderRadius: 999,
+                                        border: `1px solid ${T.primary}`,
+                                        letterSpacing: ".1em",
+                                        textTransform: "uppercase",
+                                      }}
+                                    >
+                                      選択中
+                                    </span>
+                                  )}
+                                </button>
+                                <button
+                                  onClick={() => leave(p.id)}
+                                  style={{
+                                    padding: "0 14px",
+                                    background: pending ? T.danger : T.dangerSoft,
+                                    border: `1px solid ${pending ? T.danger : "#f5c8c4"}`,
+                                    borderRadius: 12,
+                                    color: pending ? T.surface : T.danger,
+                                    fontSize: 12,
+                                    fontWeight: 700,
+                                    flexShrink: 0,
+                                    minWidth: 64,
+                                  }}
+                                >
+                                  {pending ? "確定?" : "退出"}
+                                </button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })()}
           </>
         )}
       </div>
@@ -3442,6 +4168,7 @@ function Admin({ ctx }) {
     toggleSinglesMode,
     removePlayer,
     addPlayer,
+    renamePlayer,
     resetAll,
     newSession,
     archiveCurrent,
@@ -3842,6 +4569,7 @@ function Admin({ ctx }) {
             playCount={playCount}
             onAdd={addPlayer}
             onRemove={removePlayer}
+            onRename={renamePlayer}
             restingIds={d.restingIds || []}
             onToggleResting={toggleResting}
           />
@@ -3872,21 +4600,75 @@ function Admin({ ctx }) {
   );
 }
 
-function APlayers({ players, playCount, onAdd, onRemove, restingIds, onToggleResting }) {
+function APlayers({ players, playCount, onAdd, onRemove, onRename, restingIds, onToggleResting }) {
   const [name, setName] = useState("");
+  const [yomi, setYomi] = useState("");
+  const [yomiManual, setYomiManual] = useState(false);
+  const [showYomi, setShowYomi] = useState(false);
+  const [editId, setEditId] = useState(null);
+  const [editName, setEditName] = useState("");
+  const [editYomi, setEditYomi] = useState("");
+  const [editYomiManual, setEditYomiManual] = useState(false);
   const taken = new Set(players.map((p) => p.name.toLowerCase()));
   const dupe = name.trim() && taken.has(name.trim().toLowerCase());
   const restSet = new Set(restingIds || []);
 
+  // 名前変更時、自動でふりがな(手動編集中じゃなければ)
+  useEffect(() => {
+    if (!yomiManual) setYomi(autoYomi(name));
+  }, [name, yomiManual]);
+
+  // 編集モード時の自動ふりがな
+  useEffect(() => {
+    if (editId && !editYomiManual) {
+      setEditYomi(autoYomi(editName));
+    }
+  }, [editName, editYomiManual, editId]);
+
   function add() {
     if (!name.trim() || dupe) return;
-    onAdd(name.trim());
+    onAdd(name.trim(), yomi.trim());
     setName("");
+    setYomi("");
+    setYomiManual(false);
+    setShowYomi(false);
   }
+
+  function startEdit(p) {
+    setEditId(p.id);
+    setEditName(p.name);
+    setEditYomi(p.yomi || autoYomi(p.name));
+    setEditYomiManual(!!p.yomi);
+  }
+
+  function saveEdit() {
+    if (!editName.trim()) return;
+    const editDupe = players.some(
+      (p) => p.id !== editId && p.name.toLowerCase() === editName.trim().toLowerCase()
+    );
+    if (editDupe) {
+      alert("この名前は既に他の参加者に使われています");
+      return;
+    }
+    onRename(editId, editName.trim(), editYomi.trim());
+    setEditId(null);
+  }
+
+  function cancelEdit() {
+    setEditId(null);
+    setEditName("");
+    setEditYomi("");
+    setEditYomiManual(false);
+  }
+
+  // 五十音順表示用にソート(編集中の人はそのままの位置で)
+  const sortedPlayers = [...players].sort((a, b) =>
+    yomiSortKey(a).localeCompare(yomiSortKey(b), "ja")
+  );
 
   return (
     <div>
-      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+      <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
         <input
           style={{
             flex: 1,
@@ -3901,7 +4683,7 @@ function APlayers({ players, playCount, onAdd, onRemove, restingIds, onToggleRes
           placeholder="名前を入力 → Enter"
           value={name}
           onChange={(e) => setName(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && add()}
+          onKeyDown={(e) => e.key === "Enter" && !showYomi && add()}
         />
         <button
           onClick={add}
@@ -3918,6 +4700,47 @@ function APlayers({ players, playCount, onAdd, onRemove, restingIds, onToggleRes
           ＋
         </button>
       </div>
+      {/* ふりがな入力(任意) */}
+      {!showYomi ? (
+        <button
+          onClick={() => setShowYomi(true)}
+          style={{
+            width: "100%",
+            padding: "8px",
+            background: "transparent",
+            border: `1px dashed ${T.line}`,
+            borderRadius: 8,
+            color: T.inkSoft,
+            fontSize: 11,
+            marginBottom: 16,
+            fontWeight: 500,
+          }}
+        >
+          {yomi ? `ふりがな: ${yomi}` : "+ ふりがなを追加 (任意・五十音ソート用)"}
+        </button>
+      ) : (
+        <div style={{ marginBottom: 16 }}>
+          <input
+            style={{
+              width: "100%",
+              padding: "10px 14px",
+              borderRadius: 10,
+              border: `1.5px solid ${T.line}`,
+              background: T.surface,
+              color: T.ink,
+              fontSize: 13,
+              fontWeight: 500,
+            }}
+            placeholder="ふりがな(例: たなか)"
+            value={yomi}
+            onChange={(e) => {
+              setYomi(e.target.value);
+              setYomiManual(true);
+            }}
+            onKeyDown={(e) => e.key === "Enter" && add()}
+          />
+        </div>
+      )}
       {dupe && (
         <div style={{ color: T.danger, fontSize: 12, marginTop: -10, marginBottom: 16, paddingLeft: 4 }}>
           この名前は既に使われています
@@ -3927,91 +4750,214 @@ function APlayers({ players, playCount, onAdd, onRemove, restingIds, onToggleRes
         <Empty title="参加者を追加" sub="名前を入力して追加してください" />
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16 }}>
-          {players.map((p, i) => (
-            <div
-              key={p.id}
-              style={{
-                background: T.surface,
-                borderRadius: 12,
-                padding: "12px 14px",
-                display: "flex",
-                alignItems: "center",
-                gap: 10,
-                border: `1px solid ${T.line}`,
-              }}
-            >
-              <span
-                className="mono"
+          {sortedPlayers.map((p, i) => {
+            const isEditing = editId === p.id;
+            return (
+              <div
+                key={p.id}
                 style={{
-                  width: 26,
-                  height: 26,
-                  borderRadius: 7,
-                  background: T.primary,
-                  color: T.surface,
-                  fontSize: 11,
-                  fontWeight: 700,
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  flexShrink: 0,
+                  background: T.surface,
+                  borderRadius: 12,
+                  padding: isEditing ? "10px 12px 12px" : "12px 14px",
+                  border: `1px solid ${isEditing ? T.primary : T.line}`,
                 }}
               >
-                {String(i + 1).padStart(2, "0")}
-              </span>
-              <span
-                style={{
-                  flex: 1,
-                  fontSize: 14,
-                  color: T.ink,
-                  fontWeight: 500,
-                  minWidth: 0,
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                }}
-              >
-                {p.name}
-              </span>
-              <span className="mono" style={{ fontSize: 11, color: T.inkSoft, flexShrink: 0 }}>
-                {p.wins || 0}W·{p.losses || 0}L · {playCount[p.id] || 0}試合
-              </span>
-              <button
-                onClick={() => onToggleResting && onToggleResting(p.id)}
-                style={{
-                  background: restSet.has(p.id) ? T.warn : T.surfaceWarm,
-                  border: `1px solid ${restSet.has(p.id) ? T.warn : T.line}`,
-                  color: restSet.has(p.id) ? T.surface : T.inkSoft,
-                  width: 32,
-                  height: 28,
-                  borderRadius: 7,
-                  fontSize: 14,
-                  flexShrink: 0,
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                }}
-                aria-label={restSet.has(p.id) ? "復帰" : "休憩"}
-                title={restSet.has(p.id) ? "復帰" : "休憩"}
-              >
-                {restSet.has(p.id) ? "↩" : "☕"}
-              </button>
-              <button
-                onClick={() => onRemove(p.id)}
-                style={{
-                  background: T.dangerSoft,
-                  border: "1px solid #f5c8c4",
-                  color: T.danger,
-                  width: 28,
-                  height: 28,
-                  borderRadius: 8,
-                  fontSize: 16,
-                  flexShrink: 0,
-                }}
-              >
-                ×
-              </button>
-            </div>
-          ))}
+                {isEditing ? (
+                  <div>
+                    <div
+                      className="mono"
+                      style={{
+                        fontSize: 10,
+                        color: T.primary,
+                        letterSpacing: ".15em",
+                        textTransform: "uppercase",
+                        fontWeight: 700,
+                        marginBottom: 8,
+                      }}
+                    >
+                      編集中
+                    </div>
+                    <input
+                      style={{
+                        width: "100%",
+                        padding: "10px 12px",
+                        borderRadius: 8,
+                        border: `1.5px solid ${T.line}`,
+                        background: T.surface,
+                        fontSize: 14,
+                        fontWeight: 600,
+                        marginBottom: 6,
+                      }}
+                      placeholder="名前"
+                      value={editName}
+                      onChange={(e) => setEditName(e.target.value)}
+                      autoFocus
+                    />
+                    <input
+                      style={{
+                        width: "100%",
+                        padding: "8px 12px",
+                        borderRadius: 8,
+                        border: `1.5px solid ${T.line}`,
+                        background: T.surface,
+                        fontSize: 12,
+                        fontWeight: 500,
+                        marginBottom: 8,
+                      }}
+                      placeholder="ふりがな(任意)"
+                      value={editYomi}
+                      onChange={(e) => {
+                        setEditYomi(e.target.value);
+                        setEditYomiManual(true);
+                      }}
+                    />
+                    <div style={{ fontSize: 10, color: T.inkSoft, marginBottom: 8, paddingLeft: 2, lineHeight: 1.5 }}>
+                      変更すると、過去のセッションの記録も全部更新されます
+                    </div>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <button
+                        onClick={saveEdit}
+                        style={{
+                          flex: 1,
+                          padding: "8px",
+                          background: T.primary,
+                          border: "none",
+                          borderRadius: 8,
+                          color: T.surface,
+                          fontSize: 12,
+                          fontWeight: 700,
+                        }}
+                      >
+                        保存
+                      </button>
+                      <button
+                        onClick={cancelEdit}
+                        style={{
+                          flex: 1,
+                          padding: "8px",
+                          background: T.surface,
+                          border: `1px solid ${T.line}`,
+                          borderRadius: 8,
+                          color: T.inkSoft,
+                          fontSize: 12,
+                          fontWeight: 600,
+                        }}
+                      >
+                        キャンセル
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 10,
+                    }}
+                  >
+                    <span
+                      className="mono"
+                      style={{
+                        width: 26,
+                        height: 26,
+                        borderRadius: 7,
+                        background: T.primary,
+                        color: T.surface,
+                        fontSize: 11,
+                        fontWeight: 700,
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        flexShrink: 0,
+                      }}
+                    >
+                      {String(i + 1).padStart(2, "0")}
+                    </span>
+                    <div
+                      style={{
+                        flex: 1,
+                        minWidth: 0,
+                        overflow: "hidden",
+                      }}
+                    >
+                      <div
+                        style={{
+                          fontSize: 14,
+                          color: T.ink,
+                          fontWeight: 600,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        {p.name}
+                      </div>
+                      {p.yomi && (
+                        <div className="mono" style={{ fontSize: 9, color: T.inkSoft, marginTop: 1 }}>
+                          {p.yomi}
+                        </div>
+                      )}
+                    </div>
+                    <span className="mono" style={{ fontSize: 11, color: T.inkSoft, flexShrink: 0 }}>
+                      {p.wins || 0}W·{p.losses || 0}L · {playCount[p.id] || 0}試合
+                    </span>
+                    <button
+                      onClick={() => startEdit(p)}
+                      style={{
+                        background: T.surfaceWarm,
+                        border: `1px solid ${T.line}`,
+                        color: T.inkSoft,
+                        width: 28,
+                        height: 28,
+                        borderRadius: 7,
+                        fontSize: 12,
+                        flexShrink: 0,
+                      }}
+                      aria-label="名前編集"
+                      title="名前編集"
+                    >
+                      ✎
+                    </button>
+                    <button
+                      onClick={() => onToggleResting && onToggleResting(p.id)}
+                      style={{
+                        background: restSet.has(p.id) ? T.warn : T.surfaceWarm,
+                        border: `1px solid ${restSet.has(p.id) ? T.warn : T.line}`,
+                        color: restSet.has(p.id) ? T.surface : T.inkSoft,
+                        width: 32,
+                        height: 28,
+                        borderRadius: 7,
+                        fontSize: 14,
+                        flexShrink: 0,
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                      }}
+                      aria-label={restSet.has(p.id) ? "復帰" : "休憩"}
+                      title={restSet.has(p.id) ? "復帰" : "休憩"}
+                    >
+                      {restSet.has(p.id) ? "↩" : "☕"}
+                    </button>
+                    <button
+                      onClick={() => onRemove(p.id)}
+                      style={{
+                        background: T.dangerSoft,
+                        border: "1px solid #f5c8c4",
+                        color: T.danger,
+                        width: 28,
+                        height: 28,
+                        borderRadius: 8,
+                        fontSize: 16,
+                        flexShrink: 0,
+                      }}
+                    >
+                      ×
+                    </button>
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
@@ -6276,6 +7222,17 @@ function IconCheck({ size = 22 }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
       <path d="M5 12l5 5L20 7" />
+    </svg>
+  );
+}
+function IconShare({ size = 22 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="18" cy="5" r="3" />
+      <circle cx="6" cy="12" r="3" />
+      <circle cx="18" cy="19" r="3" />
+      <line x1="8.59" y1="13.51" x2="15.42" y2="17.49" />
+      <line x1="15.41" y1="6.51" x2="8.59" y2="10.49" />
     </svg>
   );
 }
