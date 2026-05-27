@@ -683,6 +683,189 @@ function App() {
     );
   }
 
+  // 全メンバー(今日の参加者 + 過去参加者の合体版)
+  // それぞれに「今日の状態」「過去の集計」を付ける
+  function getAllMembers() {
+    const result = new Map(); // name -> 詳細情報
+    const restingSet = new Set(d.restingIds || []);
+
+    // 今日の参加者
+    players.forEach((p) => {
+      const inMatch = matches.some((m) =>
+        [...m.team1, ...m.team2].some((x) => x.id === p.id)
+      );
+      const isWaiting = waiting.some((w) => w.id === p.id);
+      const isResting = restingSet.has(p.id);
+      let todayStatus = "idle";
+      if (isResting) todayStatus = "resting";
+      else if (inMatch) todayStatus = "playing";
+      else if (isWaiting) todayStatus = "waiting";
+
+      result.set(p.name, {
+        id: p.id, // 現参加者にはidあり
+        name: p.name,
+        yomi: p.yomi || autoYomi(p.name),
+        wins: p.wins || 0,
+        losses: p.losses || 0,
+        todayStatus,
+        isJoinedToday: true,
+        attendances: 1, // 今日も1回として数える
+        lastSeen: Date.now(),
+        totalWins: p.wins || 0,
+        totalLosses: p.losses || 0,
+        totalGames: 0,
+      });
+    });
+
+    // 過去参加者の情報を統合
+    (d.savedSessions || []).forEach((s) => {
+      (s.players || []).forEach((p) => {
+        if (result.has(p.name)) {
+          // 既に今日の参加者として登録されてる → 過去情報を追加
+          const m = result.get(p.name);
+          m.attendances += 1;
+          m.lastSeen = Math.max(m.lastSeen, s.endedAt || 0);
+          m.totalWins += p.wins || 0;
+          m.totalLosses += p.losses || 0;
+          // 試合数も加算
+          (s.history || []).forEach((h) => {
+            const inT = [...h.team1, ...h.team2].some((x) => x.name === p.name);
+            if (inT) m.totalGames += 1;
+          });
+          if (!m.yomi && p.yomi) m.yomi = p.yomi;
+        } else {
+          // 完全に過去のメンバー
+          let gameCount = 0;
+          (s.history || []).forEach((h) => {
+            const inT = [...h.team1, ...h.team2].some((x) => x.name === p.name);
+            if (inT) gameCount += 1;
+          });
+          result.set(p.name, {
+            id: null,
+            name: p.name,
+            yomi: p.yomi || autoYomi(p.name),
+            wins: 0,
+            losses: 0,
+            todayStatus: "absent",
+            isJoinedToday: false,
+            attendances: 1,
+            lastSeen: s.endedAt || 0,
+            totalWins: p.wins || 0,
+            totalLosses: p.losses || 0,
+            totalGames: gameCount,
+          });
+        }
+      });
+    });
+
+    // 過去セッションでまた同名で出現したら集計追加
+    // (上のループで初回 +1 はやっているので、2回目以降のセッションでは更にカウント追加が必要)
+    // しかし上のロジックで既にループしているので、修正：
+    // セッションをまたいで集計する場合、上のロジックは「すでに登録済み」なら追加、
+    // 「初回」は1回登録する形なので、各セッションで複数回登場した場合は
+    // attendances == そのセッションでの出現回数。正しくはセッションを単位にカウント。
+
+    // 上のロジックは「セッションごとに1回ずつイテレート」で、各セッションの players をループ。
+    // セッションA・Bに同じ名前の人がいたら、Aで初登録 → Bでヒット → +1
+    // 正しい!
+
+    return Array.from(result.values()).sort((a, b) =>
+      yomiSortKey(a).localeCompare(yomiSortKey(b), "ja")
+    );
+  }
+
+  // 特定の名前の人の参加履歴を取得(過去全部のセッション)
+  function getMemberHistory(memberName) {
+    const sessions = [];
+    (d.savedSessions || []).forEach((s) => {
+      const p = (s.players || []).find((pp) => pp.name === memberName);
+      if (p) {
+        const games = (s.history || []).filter((h) =>
+          [...h.team1, ...h.team2].some((x) => x.name === memberName)
+        );
+        const wins = games.filter((h) => {
+          const winTeam = h.winner === 1 ? h.team1 : h.team2;
+          return winTeam.some((x) => x.name === memberName);
+        }).length;
+        sessions.push({
+          sessionId: s.id,
+          sessionName: s.name,
+          endedAt: s.endedAt,
+          gameCount: games.length,
+          wins,
+          losses: games.length - wins,
+        });
+      }
+    });
+    // 新しい順
+    return sessions.sort((a, b) => (b.endedAt || 0) - (a.endedAt || 0));
+  }
+
+  // 過去だけのメンバー(現在不在)の名前を完全に削除
+  // savedSessions と attendanceLog から該当名前を取り除く
+  function deleteMemberFromHistory(memberName) {
+    if (!memberName) return;
+    upd((p) => ({
+      ...p,
+      savedSessions: (p.savedSessions || []).map((s) => ({
+        ...s,
+        // この人を含まない試合は残す、含む試合は削除
+        history: (s.history || []).filter(
+          (h) =>
+            !h.team1.some((x) => x.name === memberName) &&
+            !h.team2.some((x) => x.name === memberName)
+        ),
+        // 参加者からも除外
+        players: (s.players || []).filter((pp) => pp.name !== memberName),
+      })),
+      attendanceLog: (p.attendanceLog || []).map((a) => ({
+        ...a,
+        playerNames: (a.playerNames || []).filter((n) => n !== memberName),
+      })),
+    }));
+    showToast(`「${memberName}」の過去履歴を削除しました`);
+  }
+
+  // 過去メンバーの名前(とふりがな)を変更し、過去データを全部連動更新
+  // (現在不在のメンバー用、joinPlayerが必要ない)
+  function renamePastMember(oldName, newName, newYomi) {
+    if (!oldName) return;
+    const trimmedName = (newName || "").trim();
+    if (!trimmedName) {
+      showToast("名前を入力してください");
+      return;
+    }
+    const trimmedYomi = (newYomi || "").trim();
+
+    upd((p) => ({
+      ...p,
+      savedSessions: (p.savedSessions || []).map((s) => ({
+        ...s,
+        players: (s.players || []).map((pp) =>
+          pp.name === oldName
+            ? { ...pp, name: trimmedName, yomi: trimmedYomi }
+            : pp
+        ),
+        history: (s.history || []).map((h) => ({
+          ...h,
+          team1: h.team1.map((x) =>
+            x.name === oldName ? { ...x, name: trimmedName } : x
+          ),
+          team2: h.team2.map((x) =>
+            x.name === oldName ? { ...x, name: trimmedName } : x
+          ),
+        })),
+      })),
+      attendanceLog: (p.attendanceLog || []).map((a) => ({
+        ...a,
+        playerNames: (a.playerNames || []).map((n) =>
+          n === oldName ? trimmedName : n
+        ),
+      })),
+    }));
+    showToast(`「${oldName}」を「${trimmedName}」に変更`);
+  }
+
   // 過去参加者を再度参加させる(同じ名前・ふりがなで)
   function joinAsPastPlayer(pastPlayer) {
     // 同名の人がすでに現セッションにいないか確認
@@ -1339,6 +1522,10 @@ function App() {
     removePlayer,
     getPastPlayers,
     joinAsPastPlayer,
+    getAllMembers,
+    getMemberHistory,
+    renamePastMember,
+    deleteMemberFromHistory,
     startMatches,
     regenMatches,
     finishMatch,
@@ -4169,6 +4356,11 @@ function Admin({ ctx }) {
     removePlayer,
     addPlayer,
     renamePlayer,
+    getAllMembers,
+    getMemberHistory,
+    renamePastMember,
+    deleteMemberFromHistory,
+    joinAsPastPlayer,
     resetAll,
     newSession,
     archiveCurrent,
@@ -4345,6 +4537,7 @@ function Admin({ ctx }) {
         {[
           { id: "matches", label: "試合", count: matches.length },
           { id: "players", label: "参加者", count: players.length },
+          { id: "members", label: "メンバー", count: 0 },
           { id: "session", label: "セッション", count: 0 },
           { id: "history", label: "履歴", count: (d.savedSessions || []).length },
         ].map((t) => (
@@ -4574,6 +4767,16 @@ function Admin({ ctx }) {
             onToggleResting={toggleResting}
           />
         )}
+        {tab === "members" && (
+          <MembersPanel
+            allMembers={getAllMembers()}
+            getMemberHistory={getMemberHistory}
+            onRenameCurrent={renamePlayer}
+            onRenamePast={renamePastMember}
+            onDeleteFromHistory={deleteMemberFromHistory}
+            onJoinAsPast={joinAsPastPlayer}
+          />
+        )}
         {tab === "session" && (
           <SessionPanel
             sessionStart={sessionStart}
@@ -4596,6 +4799,756 @@ function Admin({ ctx }) {
           />
         )}
       </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════
+// MembersPanel — 全メンバー一覧(今日+過去)
+// ═══════════════════════════════════════════════════════════
+function MembersPanel({ allMembers, getMemberHistory, onRenameCurrent, onRenamePast, onDeleteFromHistory, onJoinAsPast }) {
+  const [selected, setSelected] = useState(null); // メンバーの詳細表示
+  const [inlineEditName, setInlineEditName] = useState(null); // {name, ...}
+  const [editNameDraft, setEditNameDraft] = useState("");
+  const [editYomiDraft, setEditYomiDraft] = useState("");
+  const [editYomiManual, setEditYomiManual] = useState(false);
+
+  // 編集中の名前変更でふりがな自動更新
+  useEffect(() => {
+    if (inlineEditName && !editYomiManual) {
+      setEditYomiDraft(autoYomi(editNameDraft));
+    }
+  }, [editNameDraft, editYomiManual, inlineEditName]);
+
+  // 選択中のメンバーが詳細表示モード
+  if (selected) {
+    const member = allMembers.find((m) => m.name === selected);
+    if (!member) {
+      // メンバーが見つからない(削除されたなど)→一覧へ戻る
+      setSelected(null);
+      return null;
+    }
+    return (
+      <MemberDetail
+        member={member}
+        history={getMemberHistory(member.name)}
+        onBack={() => setSelected(null)}
+        onRename={(newName, newYomi) => {
+          if (member.isJoinedToday) {
+            onRenameCurrent(member.id, newName, newYomi);
+          } else {
+            onRenamePast(member.name, newName, newYomi);
+          }
+          // 選択中の名前を更新
+          setSelected(newName);
+        }}
+        onDeleteFromHistory={() => {
+          if (window.confirm(`「${member.name}」の過去履歴を全て削除しますか?\n保存セッションから参加記録と試合も消えます。`)) {
+            onDeleteFromHistory(member.name);
+            setSelected(null);
+          }
+        }}
+        onJoinToday={() => {
+          onJoinAsPast({ name: member.name, yomi: member.yomi });
+          setSelected(null);
+        }}
+      />
+    );
+  }
+
+  function startInlineEdit(member, e) {
+    e.stopPropagation();
+    setInlineEditName(member.name);
+    setEditNameDraft(member.name);
+    setEditYomiDraft(member.yomi || autoYomi(member.name));
+    setEditYomiManual(!!member.yomi);
+  }
+
+  function saveInlineEdit(originalName, isJoinedToday, memberId) {
+    if (!editNameDraft.trim()) return;
+    const trimmedName = editNameDraft.trim();
+    const trimmedYomi = editYomiDraft.trim();
+
+    // 別人と名前重複してたらやめる
+    const exists = allMembers.some(
+      (m) => m.name !== originalName && m.name === trimmedName
+    );
+    if (exists) {
+      alert("この名前は他のメンバーで既に使われています");
+      return;
+    }
+
+    if (isJoinedToday) {
+      onRenameCurrent(memberId, trimmedName, trimmedYomi);
+    } else {
+      onRenamePast(originalName, trimmedName, trimmedYomi);
+    }
+    setInlineEditName(null);
+  }
+
+  function cancelInlineEdit() {
+    setInlineEditName(null);
+    setEditNameDraft("");
+    setEditYomiDraft("");
+    setEditYomiManual(false);
+  }
+
+  // 五十音グループに分ける
+  const grouped = {};
+  allMembers.forEach((m) => {
+    const initial = yomiInitial(m);
+    if (!grouped[initial]) grouped[initial] = [];
+    grouped[initial].push(m);
+  });
+  const groupOrder = ["あ", "か", "さ", "た", "な", "は", "ま", "や", "ら", "わ", "他"];
+
+  // 前回参加日のフォーマット
+  function formatLastSeen(ts, isToday) {
+    if (isToday) return "今日";
+    if (!ts) return "—";
+    const now = Date.now();
+    const diff = now - ts;
+    const days = Math.floor(diff / 86400000);
+    if (days === 0) return "今日";
+    if (days === 1) return "昨日";
+    if (days < 7) return `${days}日前`;
+    if (days < 30) return `${Math.floor(days / 7)}週間前`;
+    if (days < 365) return `${Math.floor(days / 30)}ヶ月前`;
+    return `${Math.floor(days / 365)}年前`;
+  }
+
+  function statusLabel(s) {
+    switch (s) {
+      case "playing": return { label: "試合中", bg: T.primarySoft, color: T.primary, border: T.primary };
+      case "waiting": return { label: "待機", bg: T.warnSoft, color: T.warn, border: T.warn };
+      case "resting": return { label: "休憩中", bg: "#eef0ec", color: T.inkSoft, border: "#c7ccc4" };
+      case "idle": return { label: "参加", bg: T.surfaceWarm, color: T.ink, border: T.line };
+      case "absent": return { label: "不参加", bg: T.surface, color: T.inkSoft, border: T.lineSoft };
+      default: return { label: "—", bg: T.surface, color: T.inkSoft, border: T.line };
+    }
+  }
+
+  if (allMembers.length === 0) {
+    return <Empty title="メンバーがいません" sub="参加者を追加すると、ここに登録されます" />;
+  }
+
+  // サマリー: 今日参加 / 不参加の数
+  const todayCount = allMembers.filter((m) => m.isJoinedToday).length;
+  const pastCount = allMembers.filter((m) => !m.isJoinedToday).length;
+
+  return (
+    <div>
+      {/* サマリー */}
+      <div
+        style={{
+          background: T.bgDark,
+          color: T.surface,
+          borderRadius: 14,
+          padding: "14px 18px",
+          marginBottom: 16,
+        }}
+      >
+        <div
+          className="mono"
+          style={{
+            fontSize: 10,
+            letterSpacing: ".22em",
+            color: T.accent,
+            textTransform: "uppercase",
+            fontWeight: 700,
+            marginBottom: 8,
+          }}
+        >
+          Member List
+        </div>
+        <div style={{ display: "flex", gap: 16 }}>
+          <div style={{ flex: 1 }}>
+            <div className="mono" style={{ fontSize: 22, fontWeight: 700, color: T.accent, lineHeight: 1 }}>
+              {allMembers.length}
+            </div>
+            <div style={{ fontSize: 10, opacity: 0.55, marginTop: 4, letterSpacing: ".1em", textTransform: "uppercase" }}>
+              全メンバー
+            </div>
+          </div>
+          <div style={{ flex: 1 }}>
+            <div className="mono" style={{ fontSize: 22, fontWeight: 700, color: T.accent, lineHeight: 1 }}>
+              {todayCount}
+            </div>
+            <div style={{ fontSize: 10, opacity: 0.55, marginTop: 4, letterSpacing: ".1em", textTransform: "uppercase" }}>
+              今日参加
+            </div>
+          </div>
+          <div style={{ flex: 1 }}>
+            <div className="mono" style={{ fontSize: 22, fontWeight: 700, color: T.accent, lineHeight: 1 }}>
+              {pastCount}
+            </div>
+            <div style={{ fontSize: 10, opacity: 0.55, marginTop: 4, letterSpacing: ".1em", textTransform: "uppercase" }}>
+              休部中
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style={{ fontSize: 12, color: T.inkSoft, marginBottom: 14, paddingLeft: 4, lineHeight: 1.6 }}>
+        タップで詳細を表示・✎ボタンでクイック編集
+      </div>
+
+      {/* グループごとに表示 */}
+      {groupOrder.map((g) => {
+        const group = grouped[g];
+        if (!group || group.length === 0) return null;
+        return (
+          <div key={g} style={{ marginBottom: 18 }}>
+            <div
+              style={{
+                fontSize: 13,
+                fontWeight: 700,
+                color: T.primary,
+                marginBottom: 6,
+                paddingLeft: 4,
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+              }}
+            >
+              <span style={{ minWidth: 16 }}>{g}</span>
+              <span style={{ flex: 1, height: 1, background: T.lineSoft }} />
+              <span className="mono" style={{ fontSize: 10, color: T.inkSoft, fontWeight: 600 }}>
+                {group.length}人
+              </span>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {group.map((m) => {
+                const isEditing = inlineEditName === m.name;
+                const stat = statusLabel(m.todayStatus);
+                if (isEditing) {
+                  return (
+                    <div
+                      key={m.name}
+                      style={{
+                        background: T.surface,
+                        border: `1.5px solid ${T.primary}`,
+                        borderRadius: 12,
+                        padding: "12px 14px",
+                      }}
+                    >
+                      <div
+                        className="mono"
+                        style={{
+                          fontSize: 9,
+                          color: T.primary,
+                          letterSpacing: ".15em",
+                          textTransform: "uppercase",
+                          fontWeight: 700,
+                          marginBottom: 6,
+                        }}
+                      >
+                        編集中
+                      </div>
+                      <input
+                        style={{
+                          width: "100%",
+                          padding: "9px 12px",
+                          borderRadius: 8,
+                          border: `1.5px solid ${T.line}`,
+                          background: T.surface,
+                          fontSize: 14,
+                          fontWeight: 600,
+                          marginBottom: 5,
+                        }}
+                        placeholder="名前"
+                        value={editNameDraft}
+                        onChange={(e) => setEditNameDraft(e.target.value)}
+                        autoFocus
+                      />
+                      <input
+                        style={{
+                          width: "100%",
+                          padding: "8px 12px",
+                          borderRadius: 8,
+                          border: `1.5px solid ${T.line}`,
+                          background: T.surface,
+                          fontSize: 12,
+                          fontWeight: 500,
+                          marginBottom: 6,
+                        }}
+                        placeholder="ふりがな(任意)"
+                        value={editYomiDraft}
+                        onChange={(e) => {
+                          setEditYomiDraft(e.target.value);
+                          setEditYomiManual(true);
+                        }}
+                      />
+                      <div style={{ fontSize: 10, color: T.inkSoft, marginBottom: 8, paddingLeft: 2, lineHeight: 1.4 }}>
+                        過去の参加記録も連動して更新されます
+                      </div>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <button
+                          onClick={() => saveInlineEdit(m.name, m.isJoinedToday, m.id)}
+                          style={{
+                            flex: 1,
+                            padding: "8px",
+                            background: T.primary,
+                            border: "none",
+                            borderRadius: 8,
+                            color: T.surface,
+                            fontSize: 12,
+                            fontWeight: 700,
+                          }}
+                        >
+                          保存
+                        </button>
+                        <button
+                          onClick={cancelInlineEdit}
+                          style={{
+                            flex: 1,
+                            padding: "8px",
+                            background: T.surface,
+                            border: `1px solid ${T.line}`,
+                            borderRadius: 8,
+                            color: T.inkSoft,
+                            fontSize: 12,
+                            fontWeight: 600,
+                          }}
+                        >
+                          キャンセル
+                        </button>
+                      </div>
+                    </div>
+                  );
+                }
+                return (
+                  <button
+                    key={m.name}
+                    onClick={() => setSelected(m.name)}
+                    style={{
+                      width: "100%",
+                      background: m.isJoinedToday ? T.surface : T.surfaceWarm,
+                      border: `1px solid ${m.isJoinedToday ? T.line : T.lineSoft}`,
+                      borderRadius: 12,
+                      padding: "10px 12px",
+                      textAlign: "left",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 10,
+                      opacity: m.isJoinedToday ? 1 : 0.85,
+                    }}
+                  >
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div
+                        style={{
+                          fontSize: 14,
+                          fontWeight: 700,
+                          color: T.ink,
+                          marginBottom: 2,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        {m.name}
+                        {m.yomi && (
+                          <span className="mono" style={{ fontSize: 10, color: T.inkSoft, marginLeft: 6, fontWeight: 500 }}>
+                            {m.yomi}
+                          </span>
+                        )}
+                      </div>
+                      <div className="mono" style={{ fontSize: 10, color: T.inkSoft, display: "flex", gap: 6, alignItems: "center" }}>
+                        <span>前回: {formatLastSeen(m.lastSeen, m.isJoinedToday)}</span>
+                        <span style={{ opacity: 0.5 }}>·</span>
+                        <span>計{m.attendances}回</span>
+                      </div>
+                    </div>
+                    <span
+                      className="mono"
+                      style={{
+                        fontSize: 9,
+                        padding: "3px 7px",
+                        borderRadius: 999,
+                        background: stat.bg,
+                        color: stat.color,
+                        border: `1px solid ${stat.border}`,
+                        fontWeight: 700,
+                        letterSpacing: ".05em",
+                        flexShrink: 0,
+                      }}
+                    >
+                      {stat.label}
+                    </span>
+                    <button
+                      onClick={(e) => startInlineEdit(m, e)}
+                      style={{
+                        background: T.surfaceWarm,
+                        border: `1px solid ${T.line}`,
+                        color: T.inkSoft,
+                        width: 28,
+                        height: 28,
+                        borderRadius: 7,
+                        fontSize: 12,
+                        flexShrink: 0,
+                        cursor: "pointer",
+                      }}
+                      title="名前/ふりがな編集"
+                    >
+                      ✎
+                    </button>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── メンバー詳細画面 ──
+function MemberDetail({ member, history, onBack, onRename, onDeleteFromHistory, onJoinToday }) {
+  const [editMode, setEditMode] = useState(false);
+  const [nameDraft, setNameDraft] = useState(member.name);
+  const [yomiDraft, setYomiDraft] = useState(member.yomi || autoYomi(member.name));
+  const [yomiManual, setYomiManual] = useState(!!member.yomi);
+
+  useEffect(() => {
+    if (!yomiManual) setYomiDraft(autoYomi(nameDraft));
+  }, [nameDraft, yomiManual]);
+
+  // 全期間の合計
+  const totalGames = history.reduce((s, h) => s + h.gameCount, 0);
+  const totalWins = history.reduce((s, h) => s + h.wins, 0);
+  const totalLosses = history.reduce((s, h) => s + h.losses, 0);
+  const winRate = totalGames > 0 ? Math.round((totalWins / (totalWins + totalLosses)) * 100) : 0;
+
+  function saveEdit() {
+    if (!nameDraft.trim()) return;
+    onRename(nameDraft.trim(), yomiDraft.trim());
+    setEditMode(false);
+  }
+
+  return (
+    <div>
+      <button
+        onClick={onBack}
+        style={{
+          background: "none",
+          color: T.inkSoft,
+          fontSize: 13,
+          padding: "4px 0",
+          marginBottom: 12,
+        }}
+      >
+        ← メンバー一覧へ戻る
+      </button>
+
+      {/* ヘッダー */}
+      <div
+        style={{
+          background: T.bgDark,
+          color: T.surface,
+          borderRadius: 14,
+          padding: "18px 20px",
+          marginBottom: 16,
+        }}
+      >
+        <div
+          className="mono"
+          style={{
+            fontSize: 10,
+            letterSpacing: ".2em",
+            color: T.accent,
+            textTransform: "uppercase",
+            fontWeight: 700,
+            marginBottom: 6,
+          }}
+        >
+          Member Profile
+        </div>
+        {editMode ? (
+          <div style={{ marginBottom: 4 }}>
+            <input
+              value={nameDraft}
+              onChange={(e) => setNameDraft(e.target.value)}
+              style={{
+                width: "100%",
+                background: "rgba(255,255,255,.1)",
+                border: "1px dashed rgba(255,255,255,.3)",
+                borderRadius: 8,
+                color: T.surface,
+                fontSize: 22,
+                fontWeight: 900,
+                letterSpacing: "-.02em",
+                padding: "6px 10px",
+                marginBottom: 6,
+              }}
+              placeholder="名前"
+              autoFocus
+            />
+            <input
+              value={yomiDraft}
+              onChange={(e) => {
+                setYomiDraft(e.target.value);
+                setYomiManual(true);
+              }}
+              style={{
+                width: "100%",
+                background: "rgba(255,255,255,.1)",
+                border: "1px dashed rgba(255,255,255,.3)",
+                borderRadius: 8,
+                color: T.surface,
+                fontSize: 13,
+                fontWeight: 500,
+                padding: "6px 10px",
+                fontFamily: "Menlo, monospace",
+              }}
+              placeholder="ふりがな"
+            />
+            <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
+              <button
+                onClick={saveEdit}
+                style={{
+                  flex: 1,
+                  padding: "8px",
+                  background: T.accent,
+                  border: "none",
+                  borderRadius: 8,
+                  color: T.ink,
+                  fontSize: 12,
+                  fontWeight: 700,
+                }}
+              >
+                ✓ 保存
+              </button>
+              <button
+                onClick={() => {
+                  setEditMode(false);
+                  setNameDraft(member.name);
+                  setYomiDraft(member.yomi || autoYomi(member.name));
+                }}
+                style={{
+                  flex: 1,
+                  padding: "8px",
+                  background: "rgba(255,255,255,.1)",
+                  border: "1px solid rgba(255,255,255,.2)",
+                  borderRadius: 8,
+                  color: T.surface,
+                  fontSize: 12,
+                  fontWeight: 600,
+                }}
+              >
+                キャンセル
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div>
+            <div style={{ fontSize: 24, fontWeight: 900, letterSpacing: "-.02em", marginBottom: 2 }}>
+              {member.name}
+            </div>
+            {member.yomi && (
+              <div className="mono" style={{ fontSize: 12, opacity: 0.65, marginBottom: 4 }}>
+                {member.yomi}
+              </div>
+            )}
+            <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+              <button
+                onClick={() => setEditMode(true)}
+                style={{
+                  padding: "6px 12px",
+                  background: "rgba(244,211,94,.15)",
+                  border: `1px solid ${T.accent}`,
+                  borderRadius: 8,
+                  color: T.accent,
+                  fontSize: 11,
+                  fontWeight: 700,
+                  cursor: "pointer",
+                }}
+              >
+                ✎ 名前/ふりがなを編集
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* 集計 */}
+        <div
+          style={{
+            display: "flex",
+            gap: 16,
+            marginTop: 14,
+            paddingTop: 12,
+            borderTop: "1px solid rgba(255,255,255,.15)",
+          }}
+        >
+          <div>
+            <div className="mono" style={{ fontSize: 20, fontWeight: 700, color: T.accent, lineHeight: 1 }}>
+              {history.length}
+            </div>
+            <div style={{ fontSize: 9, opacity: 0.55, marginTop: 3, letterSpacing: ".1em", textTransform: "uppercase" }}>
+              参加回数
+            </div>
+          </div>
+          <div>
+            <div className="mono" style={{ fontSize: 20, fontWeight: 700, color: T.accent, lineHeight: 1 }}>
+              {totalGames}
+            </div>
+            <div style={{ fontSize: 9, opacity: 0.55, marginTop: 3, letterSpacing: ".1em", textTransform: "uppercase" }}>
+              総試合数
+            </div>
+          </div>
+          <div>
+            <div className="mono" style={{ fontSize: 20, fontWeight: 700, color: T.accent, lineHeight: 1 }}>
+              {totalWins}W·{totalLosses}L
+            </div>
+            <div style={{ fontSize: 9, opacity: 0.55, marginTop: 3, letterSpacing: ".1em", textTransform: "uppercase" }}>
+              通算成績
+            </div>
+          </div>
+          {totalGames > 0 && (
+            <div>
+              <div className="mono" style={{ fontSize: 20, fontWeight: 700, color: T.accent, lineHeight: 1 }}>
+                {winRate}%
+              </div>
+              <div style={{ fontSize: 9, opacity: 0.55, marginTop: 3, letterSpacing: ".1em", textTransform: "uppercase" }}>
+                勝率
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* 今日不参加の人には「今日参加させる」ボタン */}
+      {!member.isJoinedToday && (
+        <button
+          onClick={onJoinToday}
+          style={{
+            width: "100%",
+            padding: "12px",
+            background: T.primary,
+            border: "none",
+            borderRadius: 12,
+            color: T.surface,
+            fontSize: 14,
+            fontWeight: 700,
+            marginBottom: 16,
+            boxShadow: `0 4px 14px rgba(10,135,84,.25)`,
+          }}
+        >
+          + 今日の参加者として追加
+        </button>
+      )}
+
+      {/* 参加履歴 */}
+      <SectionTitle>参加履歴 · {history.length}回</SectionTitle>
+      {history.length === 0 ? (
+        <div style={{
+          padding: 14,
+          background: T.surface,
+          border: `1px solid ${T.line}`,
+          borderRadius: 12,
+          fontSize: 12,
+          color: T.inkSoft,
+          textAlign: "center",
+          fontStyle: "italic",
+          marginBottom: 16,
+        }}>
+          まだ参加記録がありません
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 16 }}>
+          {history.map((h) => {
+            const date = h.endedAt ? new Date(h.endedAt) : null;
+            const dateStr = date
+              ? date.toLocaleDateString("ja-JP", {
+                  year: "numeric",
+                  month: "2-digit",
+                  day: "2-digit",
+                })
+              : "";
+            const rate = h.gameCount > 0 ? Math.round((h.wins / (h.wins + h.losses)) * 100) : 0;
+            return (
+              <div
+                key={h.sessionId}
+                style={{
+                  background: T.surface,
+                  border: `1px solid ${T.line}`,
+                  borderRadius: 10,
+                  padding: "10px 12px",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 10,
+                }}
+              >
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: T.ink, marginBottom: 2 }}>
+                    {h.sessionName}
+                  </div>
+                  <div className="mono" style={{ fontSize: 10, color: T.inkSoft }}>
+                    {dateStr}
+                  </div>
+                </div>
+                <span className="mono" style={{ fontSize: 11, color: T.inkSoft }}>
+                  {h.gameCount}試合
+                </span>
+                {h.gameCount > 0 && (
+                  <>
+                    <span className="mono" style={{ fontSize: 11, color: T.inkSoft }}>
+                      {h.wins}W·{h.losses}L
+                    </span>
+                    <span
+                      className="mono"
+                      style={{
+                        fontSize: 12,
+                        fontWeight: 700,
+                        color: rate >= 50 ? T.primary : T.inkSoft,
+                        minWidth: 38,
+                        textAlign: "right",
+                      }}
+                    >
+                      {rate}%
+                    </span>
+                  </>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* 過去履歴の完全削除(今日参加してない人のみ) */}
+      {!member.isJoinedToday && (
+        <div
+          style={{
+            background: T.dangerSoft,
+            border: "1px solid #f5c8c4",
+            borderRadius: 12,
+            padding: 14,
+            marginTop: 24,
+          }}
+        >
+          <div className="mono" style={{ fontSize: 10, color: T.danger, fontWeight: 700, marginBottom: 8, letterSpacing: ".15em", textTransform: "uppercase" }}>
+            危険な操作
+          </div>
+          <div style={{ fontSize: 12, color: T.danger, lineHeight: 1.6, marginBottom: 10 }}>
+            このメンバーの過去履歴を全て削除します。保存セッションからこの人の参加記録と関連試合が消えます。元に戻せません。
+          </div>
+          <button
+            onClick={onDeleteFromHistory}
+            style={{
+              width: "100%",
+              padding: "10px",
+              background: T.surface,
+              border: `1px solid ${T.danger}`,
+              borderRadius: 10,
+              color: T.danger,
+              fontWeight: 700,
+              fontSize: 13,
+            }}
+          >
+            このメンバーの履歴を削除
+          </button>
+        </div>
+      )}
     </div>
   );
 }
