@@ -141,58 +141,65 @@ function yomiInitial(player) {
 // 用途:
 //   ユーザーが「たなか」と打って「田中」に変換すると、変換確定時に
 //   onYomiHint("たなか")が呼ばれる(自動でふりがな欄に反映できる)
+// 仕組み:
+//   1. compositionupdate イベントで、IME入力中のひらがなを記録
+//   2. onInput イベントでも、composition中の値をDOMから取得して記録
+//      (一部ブラウザはcompositionupdateを発火しないため二重で取得)
+//   3. compositionend で記録したひらがなを onYomiHint で通知
 // props:
 //   value, onChange, onYomiHint(yomi), placeholder, style, etc...
 // ────────────────────────────────────────────
 function NameInput({ value, onChange, onYomiHint, ...rest }) {
   const composingRef = useRef(false);
-  // composition中(IME未確定中)の最新のひらがな入力を覚えておく
-  const lastCompositionDataRef = useRef("");
-  // 直前の名前値(変換前のひらがな状態を取得するため)
-  const lastValueRef = useRef(value || "");
+  // composition中のひらがな入力を覚えておく
+  const lastCompositionTextRef = useRef("");
 
   function handleCompositionStart(e) {
     composingRef.current = true;
-    lastCompositionDataRef.current = "";
+    lastCompositionTextRef.current = "";
   }
 
   function handleCompositionUpdate(e) {
     // 変換中(IMEがひらがなを表示してる状態)のdataを覚えておく
-    // ブラウザによってe.dataがひらがなだったり漢字だったり違うので
-    // input欄の現在の値も併用
     if (e.data) {
-      lastCompositionDataRef.current = e.data;
+      lastCompositionTextRef.current = e.data;
+    }
+  }
+
+  // input イベント(composition中も含めて毎入力で発火)
+  // composition中なら、現在のinputの値を覚えておく
+  function handleInput(e) {
+    if (composingRef.current && e.target.value) {
+      // composition中はinputの値そのものがひらがな
+      lastCompositionTextRef.current = e.target.value;
     }
   }
 
   function handleCompositionEnd(e) {
     composingRef.current = false;
-    // composition終了時のe.dataは変換後文字(漢字)のことが多いので使えない
-    // 代わりにcomposition中に記録した最新のひらがなを使う
-    let composed = lastCompositionDataRef.current;
-    // それも空なら、e.dataから取得を試みる
+    let composed = lastCompositionTextRef.current;
     if (!composed && e.data) {
       composed = e.data;
     }
 
     if (composed && onYomiHint) {
-      // ひらがな or カタカナだけなら採用
       const isAllKana = /^[\u3040-\u309f\u30a0-\u30ff\u30fc\s・ー]+$/.test(composed);
       if (isAllKana) {
-        // カタカナ→ひらがな変換
         const yomi = composed.replace(/[\u30a1-\u30f6]/g, (c) =>
           String.fromCharCode(c.charCodeAt(0) - 0x60)
         );
+        // composition end の直後に呼ぶ + 次のtickでも保険として呼ぶ
+        // (useEffectで上書きされる可能性があるため)
         onYomiHint(yomi);
+        setTimeout(() => onYomiHint(yomi), 50);
       }
     }
-    lastCompositionDataRef.current = "";
+    lastCompositionTextRef.current = "";
   }
 
   function handleChange(e) {
     const newValue = e.target.value;
-    // composition中じゃない時の入力(直接ひらがな貼り付け、削除など)
-    // ひらがな or カタカナだけ入力されたら、それもyomiヒントに
+    // composition中じゃない時の入力(直接ひらがな入力、貼り付け、削除など)
     if (!composingRef.current && onYomiHint && newValue) {
       const trimmed = newValue.trim();
       if (trimmed) {
@@ -205,7 +212,6 @@ function NameInput({ value, onChange, onYomiHint, ...rest }) {
         }
       }
     }
-    lastValueRef.current = newValue;
     onChange && onChange(e);
   }
 
@@ -214,6 +220,7 @@ function NameInput({ value, onChange, onYomiHint, ...rest }) {
       {...rest}
       value={value}
       onChange={handleChange}
+      onInput={handleInput}
       onCompositionStart={handleCompositionStart}
       onCompositionUpdate={handleCompositionUpdate}
       onCompositionEnd={handleCompositionEnd}
@@ -239,6 +246,21 @@ function blankRoom() {
     restingIds: [], // 休憩中のプレイヤーID
     singlesMode: false, // シングルスモード
     registeredMembers: [], // クラブ名簿(連絡先のように事前登録)
+    sessionNotes: "", // 開催メモ(現セッション用)
+    costInfo: defaultCostInfo(), // 費用情報(現セッション用)
+  };
+}
+
+// 費用情報のデフォルト値
+function defaultCostInfo() {
+  return {
+    gymRate: 700, // 体育館代単価(円/時間)
+    gymCourts: 2, // コート面数
+    gymHours: 2.5, // 利用時間
+    shuttleCost: 0, // シャトル代
+    otherItems: [], // 追加項目 [{label, amount}]
+    roundUnit: 100, // 切り上げ単位
+    customParticipants: null, // 参加人数を手動指定する場合
   };
 }
 
@@ -256,6 +278,10 @@ function normalizeRoom(data) {
   merged.restingIds = merged.restingIds || [];
   merged.singlesMode = !!merged.singlesMode;
   merged.registeredMembers = merged.registeredMembers || [];
+  merged.sessionNotes = merged.sessionNotes || "";
+  merged.costInfo = merged.costInfo || defaultCostInfo();
+  // costInfo の必須プロパティ補完
+  merged.costInfo = { ...defaultCostInfo(), ...merged.costInfo };
   return merged;
 }
 
@@ -622,6 +648,16 @@ function getViewMode() {
 const VIEW_MODE = getViewMode();
 const IS_PLAYER_VIEW = VIEW_MODE === "player";
 
+// URLの ?result=session_id を取得(あればその結果画面を表示)
+function getResultSessionId() {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    return params.get("result") || null;
+  } catch (e) {
+    return null;
+  }
+}
+
 // ═══════════════════════════════════════════════════════════
 // App-level passphrase (entry password)
 // ═══════════════════════════════════════════════════════════
@@ -763,6 +799,24 @@ function App() {
           if (!existing.yomi && p.yomi) existing.yomi = p.yomi;
         }
       });
+    });
+
+    // 事前登録メンバー(まだ参加してない人)も追加
+    (d.registeredMembers || []).forEach((rm) => {
+      if (currentNames.has(rm.name)) return; // 今日参加済みはスキップ
+      if (seen.has(rm.name)) {
+        // 過去参加者として既にある場合、yomi補完のみ
+        const existing = seen.get(rm.name);
+        if (!existing.yomi && rm.yomi) existing.yomi = rm.yomi;
+      } else {
+        // 純粋な登録メンバー
+        seen.set(rm.name, {
+          name: rm.name,
+          yomi: rm.yomi || autoYomi(rm.name),
+          lastSeen: 0,
+          attendances: 0, // まだ参加実績なし
+        });
+      }
     });
 
     return Array.from(seen.values()).sort((a, b) =>
@@ -1440,6 +1494,7 @@ function App() {
         players: players.map((p) => ({
           id: p.id,
           name: p.name,
+          yomi: p.yomi || "",
           wins: p.wins || 0,
           losses: p.losses || 0,
         })),
@@ -1452,6 +1507,8 @@ function App() {
           createdAt: m.createdAt,
           endedAt: m.endedAt,
         })),
+        notes: d.sessionNotes || "",
+        costInfo: d.costInfo || defaultCostInfo(),
       };
       savedSessions = [...savedSessions, archive];
       // 出席ログを追加
@@ -1501,6 +1558,7 @@ function App() {
       players: players.map((p) => ({
         id: p.id,
         name: p.name,
+        yomi: p.yomi || "",
         wins: p.wins || 0,
         losses: p.losses || 0,
       })),
@@ -1513,6 +1571,8 @@ function App() {
         createdAt: m.createdAt,
         endedAt: m.endedAt,
       })),
+      notes: d.sessionNotes || "",
+      costInfo: d.costInfo || defaultCostInfo(),
     };
     const newAttendance = {
       sessionId: archive.id,
@@ -1527,6 +1587,37 @@ function App() {
       attendanceLog: [...(p.attendanceLog || []), newAttendance],
     }));
     showToast(`「${saveAs}」を保存しました`);
+  }
+
+  // 開催メモを更新(現セッション)
+  function updateSessionNotes(notes) {
+    upd((p) => ({ ...p, sessionNotes: notes || "" }));
+  }
+
+  // 費用情報を更新(現セッション)
+  function updateCostInfo(costInfo) {
+    upd((p) => ({ ...p, costInfo: { ...defaultCostInfo(), ...costInfo } }));
+  }
+
+  // 過去セッションのメモを更新
+  function updateArchiveNotes(sessionId, notes) {
+    upd((p) => ({
+      ...p,
+      savedSessions: (p.savedSessions || []).map((s) =>
+        s.id === sessionId ? { ...s, notes: notes || "" } : s
+      ),
+    }));
+    showToast("メモを更新しました");
+  }
+
+  // 過去セッションの費用情報を更新
+  function updateArchiveCostInfo(sessionId, costInfo) {
+    upd((p) => ({
+      ...p,
+      savedSessions: (p.savedSessions || []).map((s) =>
+        s.id === sessionId ? { ...s, costInfo: { ...defaultCostInfo(), ...costInfo } } : s
+      ),
+    }));
   }
 
   // アーカイブされたセッションを削除
@@ -1708,6 +1799,10 @@ function App() {
     editArchiveMatch,
     deleteArchiveMatch,
     deleteArchivePlayer,
+    updateSessionNotes,
+    updateCostInfo,
+    updateArchiveNotes,
+    updateArchiveCostInfo,
     undo,
     undoCount,
     setMode,
@@ -1752,6 +1847,54 @@ function App() {
         </div>
       </div>
     );
+  }
+
+  // ?result=session_id があれば、結果画面を最優先で表示(共有用)
+  const resultId = getResultSessionId();
+  if (resultId) {
+    const resultSession = (d.savedSessions || []).find((s) => s.id === resultId);
+    if (resultSession) {
+      return (
+        <div style={{ minHeight: "100vh", background: T.bg, color: T.ink }}>
+          {toast && (
+            <div
+              style={{
+                position: "fixed",
+                top: 16,
+                left: "50%",
+                transform: "translateX(-50%)",
+                background: T.ink,
+                color: T.surface,
+                padding: "10px 20px",
+                borderRadius: 999,
+                fontSize: 13,
+                fontWeight: 600,
+                zIndex: 500,
+                boxShadow: "0 4px 20px rgba(0,0,0,.2)",
+              }}
+            >
+              {toast}
+            </div>
+          )}
+          <SessionResultView
+            session={resultSession}
+            ctx={ctx}
+            isShareMode={true}
+            onClose={() => {
+              // URLからresultパラメータを消してリロード
+              try {
+                const u = new URL(window.location.href);
+                u.searchParams.delete("result");
+                window.location.href = u.toString();
+              } catch (e) {
+                setMode("home");
+              }
+            }}
+          />
+        </div>
+      );
+    }
+    // セッションが見つからない場合は通常表示にフォールスルー
   }
 
   return (
@@ -2436,13 +2579,14 @@ function JoinNew({ ctx }) {
   const dupe = name.trim() && taken.has(name.trim().toLowerCase());
 
   // 名前変更時、自動ふりがな(手動編集中じゃなければ)
-  // ただし、漢字変換などで autoYomi が空文字を返す時は既存のyomiを保持
+  // ・ひらがな/カタカナ入力 → ふりがなに反映(ただし既存のyomiがある場合は上書きしない)
+  // ・漢字に変換された場合 → 既存yomiを維持(消さない)
+  // ・名前が空になった → yomiも空に
   useEffect(() => {
     if (!yomiManual) {
       const auto = autoYomi(name);
-      // ひらがな/カタカナ入力なら自動でふりがな反映
-      // 漢字の場合は既存のyomi(composition で入ったかも)を維持
       if (auto) {
+        // ひらがな/カタカナのみ入力中。yomiが空ならセット、すでにある場合も同じ値なら問題ない
         setYomi(auto);
       } else if (!name.trim()) {
         // 名前が空になったらyomiも空に
@@ -2724,7 +2868,7 @@ function JoinNew({ ctx }) {
                   fontWeight: 700,
                 }}
               >
-                Past Players
+                Members
               </div>
               <div style={{ flex: 1 }} />
               <div
@@ -2735,7 +2879,7 @@ function JoinNew({ ctx }) {
               </div>
             </div>
             <div style={{ fontSize: 12, color: T.inkSoft, marginBottom: 14, lineHeight: 1.6 }}>
-              前回までに参加した方は、タップで再参加できます (五十音順)
+              登録メンバーから、タップで参加できます (五十音順)
             </div>
 
             {groupOrder.map((g) => {
@@ -4553,6 +4697,10 @@ function Admin({ ctx }) {
     editArchiveMatch,
     deleteArchiveMatch,
     deleteArchivePlayer,
+    updateSessionNotes,
+    updateCostInfo,
+    updateArchiveNotes,
+    updateArchiveCostInfo,
     undo,
     undoCount,
     upd,
@@ -4972,10 +5120,15 @@ function Admin({ ctx }) {
             onNewSession={newSession}
             onReset={resetAll}
             onArchive={archiveCurrent}
+            sessionNotes={d.sessionNotes || ""}
+            onUpdateNotes={updateSessionNotes}
+            costInfo={d.costInfo}
+            onUpdateCostInfo={updateCostInfo}
           />
         )}
         {tab === "history" && (
           <HistoryPanel
+            ctx={ctx}
             savedSessions={d.savedSessions || []}
             attendanceLog={d.attendanceLog || []}
             onDelete={deleteArchive}
@@ -6339,7 +6492,391 @@ function APlayers({ players, playCount, onAdd, onRemove, onRename, restingIds, o
 // ═══════════════════════════════════════════════════════════
 // SessionPanel — 新しい大会の開始 / リセット
 // ═══════════════════════════════════════════════════════════
-function SessionPanel({ sessionStart, playerCount, historyCount, onNewSession, onReset, onArchive }) {
+// ═══════════════════════════════════════════════════════════
+// CostCalculator — 体育館費用計算機
+// ═══════════════════════════════════════════════════════════
+function CostCalculator({ costInfo, onChange, participantCount, compact }) {
+  const c = { ...defaultCostInfo(), ...costInfo };
+
+  function setField(key, val) {
+    onChange({ ...c, [key]: val });
+  }
+
+  function addOther() {
+    onChange({ ...c, otherItems: [...(c.otherItems || []), { label: "", amount: 0 }] });
+  }
+
+  function updateOther(i, key, val) {
+    const items = [...(c.otherItems || [])];
+    items[i] = { ...items[i], [key]: val };
+    onChange({ ...c, otherItems: items });
+  }
+
+  function removeOther(i) {
+    const items = (c.otherItems || []).filter((_, idx) => idx !== i);
+    onChange({ ...c, otherItems: items });
+  }
+
+  // 計算ロジック
+  const gymTotal = Math.round((c.gymRate || 0) * (c.gymCourts || 0) * (c.gymHours || 0));
+  const shuttle = Number(c.shuttleCost) || 0;
+  const others = (c.otherItems || []).reduce((s, it) => s + (Number(it.amount) || 0), 0);
+  const total = gymTotal + shuttle + others;
+  const actualParticipants = c.customParticipants && c.customParticipants > 0
+    ? c.customParticipants
+    : (participantCount || 0);
+  const perPerson = actualParticipants > 0 ? total / actualParticipants : 0;
+  const roundUnit = c.roundUnit || 100;
+  const perPersonRounded = roundUnit > 0
+    ? Math.ceil(perPerson / roundUnit) * roundUnit
+    : Math.ceil(perPerson);
+
+  // 数値入力スタイル
+  const numInputStyle = {
+    width: "100%",
+    padding: "8px 10px",
+    borderRadius: 8,
+    border: `1.5px solid ${T.line}`,
+    background: T.surface,
+    fontSize: 13,
+    fontWeight: 600,
+    fontFamily: "Menlo, monospace",
+    textAlign: "right",
+  };
+
+  const labelStyle = {
+    fontSize: 11,
+    color: T.inkSoft,
+    marginBottom: 3,
+    fontWeight: 600,
+  };
+
+  return (
+    <div
+      style={{
+        background: T.surface,
+        border: `1px solid ${T.line}`,
+        borderRadius: 12,
+        padding: 14,
+      }}
+    >
+      {/* 体育館代 */}
+      <div style={{ marginBottom: 12 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: T.ink, marginBottom: 8 }}>
+          🏟 体育館代
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+          <div>
+            <div style={labelStyle}>単価(円/時)</div>
+            <input
+              type="number"
+              inputMode="numeric"
+              style={numInputStyle}
+              value={c.gymRate || ""}
+              onChange={(e) => setField("gymRate", Number(e.target.value) || 0)}
+              placeholder="700"
+            />
+          </div>
+          <div>
+            <div style={labelStyle}>面数</div>
+            <input
+              type="number"
+              inputMode="numeric"
+              style={numInputStyle}
+              value={c.gymCourts || ""}
+              onChange={(e) => setField("gymCourts", Number(e.target.value) || 0)}
+              placeholder="2"
+            />
+          </div>
+          <div>
+            <div style={labelStyle}>時間(h)</div>
+            <input
+              type="number"
+              inputMode="decimal"
+              step="0.5"
+              style={numInputStyle}
+              value={c.gymHours || ""}
+              onChange={(e) => setField("gymHours", Number(e.target.value) || 0)}
+              placeholder="2.5"
+            />
+          </div>
+        </div>
+        <div className="mono" style={{ fontSize: 11, color: T.inkSoft, marginTop: 6, textAlign: "right" }}>
+          = ¥{gymTotal.toLocaleString()}
+        </div>
+      </div>
+
+      {/* シャトル代 */}
+      <div style={{ marginBottom: 12 }}>
+        <div style={{ ...labelStyle, fontWeight: 700, color: T.ink, fontSize: 12, marginBottom: 6 }}>
+          🏸 シャトル代
+        </div>
+        <input
+          type="number"
+          inputMode="numeric"
+          style={numInputStyle}
+          value={c.shuttleCost || ""}
+          onChange={(e) => setField("shuttleCost", Number(e.target.value) || 0)}
+          placeholder="0"
+        />
+      </div>
+
+      {/* その他費用 */}
+      <div style={{ marginBottom: 12 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: T.ink, marginBottom: 6, display: "flex", alignItems: "center" }}>
+          <span style={{ flex: 1 }}>📦 その他費用</span>
+          <button
+            onClick={addOther}
+            style={{
+              background: T.primarySoft,
+              border: `1px solid ${T.primary}`,
+              color: T.primary,
+              fontSize: 10,
+              padding: "3px 8px",
+              borderRadius: 6,
+              fontWeight: 700,
+            }}
+          >
+            + 項目追加
+          </button>
+        </div>
+        {(c.otherItems || []).length === 0 ? (
+          <div style={{ fontSize: 10, color: T.inkSoft, paddingLeft: 4, fontStyle: "italic" }}>
+            (項目を追加できます)
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            {(c.otherItems || []).map((it, i) => (
+              <div key={i} style={{ display: "flex", gap: 4 }}>
+                <input
+                  type="text"
+                  style={{
+                    flex: 1,
+                    padding: "7px 10px",
+                    borderRadius: 6,
+                    border: `1.5px solid ${T.line}`,
+                    fontSize: 12,
+                  }}
+                  placeholder="項目名"
+                  value={it.label || ""}
+                  onChange={(e) => updateOther(i, "label", e.target.value)}
+                />
+                <input
+                  type="number"
+                  inputMode="numeric"
+                  style={{
+                    ...numInputStyle,
+                    width: 90,
+                    padding: "7px 10px",
+                    fontSize: 12,
+                  }}
+                  placeholder="金額"
+                  value={it.amount || ""}
+                  onChange={(e) => updateOther(i, "amount", Number(e.target.value) || 0)}
+                />
+                <button
+                  onClick={() => removeOther(i)}
+                  style={{
+                    background: T.dangerSoft,
+                    border: "1px solid #f5c8c4",
+                    color: T.danger,
+                    fontSize: 14,
+                    width: 30,
+                    borderRadius: 6,
+                  }}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* 参加人数 */}
+      <div style={{ marginBottom: 12 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: T.ink, marginBottom: 6 }}>
+          👥 参加人数 <span style={{ fontSize: 10, color: T.inkSoft, fontWeight: 500 }}>(自動: {participantCount}人)</span>
+        </div>
+        <input
+          type="number"
+          inputMode="numeric"
+          style={numInputStyle}
+          value={c.customParticipants || ""}
+          onChange={(e) => {
+            const v = Number(e.target.value);
+            setField("customParticipants", v > 0 ? v : null);
+          }}
+          placeholder={`${participantCount || 0}(自動)`}
+        />
+      </div>
+
+      {/* 切り上げ単位 */}
+      <div style={{ marginBottom: 14 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: T.ink, marginBottom: 6 }}>
+          💴 切り上げ単位
+        </div>
+        <div style={{ display: "flex", gap: 4 }}>
+          {[1, 10, 50, 100, 500, 1000].map((u) => (
+            <button
+              key={u}
+              onClick={() => setField("roundUnit", u)}
+              style={{
+                flex: 1,
+                padding: "8px 4px",
+                background: c.roundUnit === u ? T.primary : T.surface,
+                border: `1px solid ${c.roundUnit === u ? T.primary : T.line}`,
+                color: c.roundUnit === u ? T.surface : T.inkSoft,
+                fontSize: 11,
+                fontWeight: 700,
+                borderRadius: 6,
+                fontFamily: "Menlo, monospace",
+              }}
+            >
+              {u}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* 計算結果 */}
+      <div
+        style={{
+          background: T.bgDark,
+          color: T.surface,
+          borderRadius: 10,
+          padding: 14,
+        }}
+      >
+        <div
+          className="mono"
+          style={{
+            fontSize: 9,
+            letterSpacing: ".22em",
+            color: T.accent,
+            textTransform: "uppercase",
+            fontWeight: 700,
+            marginBottom: 10,
+          }}
+        >
+          計算結果
+        </div>
+
+        {/* 内訳 */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12 }}>
+          <div style={{ display: "flex" }}>
+            <span style={{ flex: 1, opacity: 0.75 }}>体育館代</span>
+            <span className="mono" style={{ opacity: 0.9 }}>
+              ¥{(c.gymRate || 0).toLocaleString()} × {c.gymCourts}面 × {c.gymHours}h
+            </span>
+            <span className="mono" style={{ marginLeft: 10, fontWeight: 700, color: T.accent, minWidth: 70, textAlign: "right" }}>
+              ¥{gymTotal.toLocaleString()}
+            </span>
+          </div>
+          {shuttle > 0 && (
+            <div style={{ display: "flex" }}>
+              <span style={{ flex: 1, opacity: 0.75 }}>シャトル代</span>
+              <span className="mono" style={{ marginLeft: 10, fontWeight: 700, color: T.accent, minWidth: 70, textAlign: "right" }}>
+                ¥{shuttle.toLocaleString()}
+              </span>
+            </div>
+          )}
+          {(c.otherItems || []).map((it, i) => (
+            (Number(it.amount) > 0) && (
+              <div key={i} style={{ display: "flex" }}>
+                <span style={{ flex: 1, opacity: 0.75 }}>{it.label || "その他"}</span>
+                <span className="mono" style={{ marginLeft: 10, fontWeight: 700, color: T.accent, minWidth: 70, textAlign: "right" }}>
+                  ¥{Number(it.amount).toLocaleString()}
+                </span>
+              </div>
+            )
+          ))}
+          <div style={{ display: "flex", marginTop: 6, paddingTop: 8, borderTop: "1px solid rgba(255,255,255,.15)" }}>
+            <span style={{ flex: 1, fontWeight: 700 }}>合計</span>
+            <span className="mono" style={{ fontWeight: 700, color: T.accent, fontSize: 14 }}>
+              ¥{total.toLocaleString()}
+            </span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", marginTop: 2 }}>
+            <span style={{ flex: 1, opacity: 0.65, fontSize: 11 }}>
+              ÷ {actualParticipants}人
+            </span>
+          </div>
+        </div>
+
+        {/* 1人あたり */}
+        <div
+          style={{
+            marginTop: 12,
+            paddingTop: 12,
+            borderTop: "1px solid rgba(244,211,94,.3)",
+          }}
+        >
+          <div className="mono" style={{ fontSize: 9, letterSpacing: ".15em", color: T.accent, opacity: 0.8, marginBottom: 4 }}>
+            1人あたり
+          </div>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
+            <div>
+              <div className="mono" style={{ fontSize: 22, fontWeight: 700, color: T.surface, lineHeight: 1 }}>
+                ¥{Math.round(perPerson).toLocaleString()}
+              </div>
+              <div style={{ fontSize: 9, opacity: 0.55, marginTop: 2 }}>1円単位</div>
+            </div>
+            <div style={{ flex: 1, textAlign: "right" }}>
+              <div className="mono" style={{ fontSize: 26, fontWeight: 900, color: T.accent, lineHeight: 1 }}>
+                ¥{perPersonRounded.toLocaleString()}
+              </div>
+              <div style={{ fontSize: 9, opacity: 0.55, marginTop: 2, color: T.accent }}>
+                ¥{roundUnit}単位切り上げ
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════
+// NotesPanel — 開催メモ
+// ═══════════════════════════════════════════════════════════
+function NotesPanel({ notes, onChange }) {
+  return (
+    <div
+      style={{
+        background: T.surface,
+        border: `1px solid ${T.line}`,
+        borderRadius: 12,
+        padding: 12,
+      }}
+    >
+      <textarea
+        value={notes || ""}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder="次回の予定、忘れ物連絡、感想など自由にどうぞ..."
+        style={{
+          width: "100%",
+          minHeight: 100,
+          padding: "10px 12px",
+          borderRadius: 8,
+          border: `1.5px solid ${T.line}`,
+          background: T.surfaceWarm,
+          fontSize: 13,
+          fontFamily: "inherit",
+          lineHeight: 1.6,
+          resize: "vertical",
+          outline: "none",
+          color: T.ink,
+        }}
+      />
+      <div style={{ fontSize: 10, color: T.inkSoft, marginTop: 6, paddingLeft: 4 }}>
+        {(notes || "").length}文字 · 参加者と共有する結果画面にも表示されます
+      </div>
+    </div>
+  );
+}
+
+function SessionPanel({ sessionStart, playerCount, historyCount, onNewSession, onReset, onArchive, sessionNotes, onUpdateNotes, costInfo, onUpdateCostInfo }) {
   // セッション名のデフォルト(日付ベース) — yyyy.MM.dd回
   function defaultName() {
     const d = new Date();
@@ -6422,6 +6959,22 @@ function SessionPanel({ sessionStart, playerCount, historyCount, onNewSession, o
             開始: <span className="mono">{sessionStart}</span>
           </div>
         )}
+      </div>
+
+      {/* 開催メモ */}
+      <SectionTitle>📝 開催メモ</SectionTitle>
+      <div style={{ marginBottom: 18 }}>
+        <NotesPanel notes={sessionNotes} onChange={onUpdateNotes} />
+      </div>
+
+      {/* 費用計算 */}
+      <SectionTitle>💰 費用計算</SectionTitle>
+      <div style={{ marginBottom: 18 }}>
+        <CostCalculator
+          costInfo={costInfo}
+          onChange={onUpdateCostInfo}
+          participantCount={playerCount}
+        />
       </div>
 
       {/* セッション名入力 */}
@@ -6612,7 +7165,7 @@ function SessionPanel({ sessionStart, playerCount, historyCount, onNewSession, o
 // ═══════════════════════════════════════════════════════════
 // HistoryPanel — 過去セッションと参加者傾向の閲覧
 // ═══════════════════════════════════════════════════════════
-function HistoryPanel({ savedSessions, attendanceLog, onDelete, onRename, onEditMatch, onDeleteMatch, onDeletePlayer }) {
+function HistoryPanel({ ctx, savedSessions, attendanceLog, onDelete, onRename, onEditMatch, onDeleteMatch, onDeletePlayer }) {
   const [selectedId, setSelectedId] = useState(null);
   const [view, setView] = useState("list"); // list | trends
 
@@ -6625,6 +7178,7 @@ function HistoryPanel({ savedSessions, attendanceLog, onDelete, onRename, onEdit
     return (
       <SessionDetailView
         session={selected}
+        ctx={ctx}
         onBack={() => setSelectedId(null)}
         onDelete={() => {
           if (window.confirm(`「${selected.name}」を削除しますか?`)) {
@@ -7145,12 +7699,616 @@ function PDFPreviewModal({ session, playCount, ranked, dateStr, onClose }) {
   );
 }
 
+// ═══════════════════════════════════════════════════════════
+// SessionResultView — 結果共有用の美しいページ
+// 管理者/参加者の両方が見られる、PDFと同じデザインのweb版
+// URL: ?result=session_id でも開ける
+// ═══════════════════════════════════════════════════════════
+function SessionResultView({ session, ctx, onClose, isShareMode }) {
+  const playCount = computePlayCount(session);
+  const ranked = computeRanked(session);
+  const dateStr = session.endedAt
+    ? new Date(session.endedAt).toLocaleDateString("ja-JP", {
+        year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
+      })
+    : "";
+
+  const cost = session.costInfo || defaultCostInfo();
+  const players = session.players || [];
+  const history = session.history || [];
+  const notes = session.notes || "";
+
+  // 費用計算
+  const gymTotal = Math.round((cost.gymRate || 0) * (cost.gymCourts || 0) * (cost.gymHours || 0));
+  const shuttle = Number(cost.shuttleCost) || 0;
+  const others = (cost.otherItems || []).reduce((s, it) => s + (Number(it.amount) || 0), 0);
+  const total = gymTotal + shuttle + others;
+  const actualParticipants = cost.customParticipants && cost.customParticipants > 0
+    ? cost.customParticipants
+    : players.length;
+  const perPerson = actualParticipants > 0 ? total / actualParticipants : 0;
+  const roundUnit = cost.roundUnit || 100;
+  const perPersonRounded = roundUnit > 0
+    ? Math.ceil(perPerson / roundUnit) * roundUnit
+    : Math.ceil(perPerson);
+  const hasAnyCost = total > 0;
+
+  // 共有URL作成
+  const shareUrl = (() => {
+    try {
+      const u = new URL(window.location.href);
+      u.searchParams.set("view", "player");
+      u.searchParams.set("result", session.id);
+      u.searchParams.delete("join");
+      u.hash = "";
+      return u.toString();
+    } catch (e) {
+      return "";
+    }
+  })();
+
+  const [copied, setCopied] = useState(false);
+
+  async function copyShareUrl() {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(shareUrl);
+      } else {
+        const ta = document.createElement("textarea");
+        ta.value = shareUrl;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+      }
+      setCopied(true);
+      if (ctx && ctx.showToast) ctx.showToast("結果共有URLをコピーしました");
+      setTimeout(() => setCopied(false), 2000);
+    } catch (e) {
+      if (ctx && ctx.showToast) ctx.showToast("コピーに失敗しました");
+    }
+  }
+
+  return (
+    <div style={{ minHeight: "100vh", background: T.bg, padding: "20px 20px 60px" }}>
+      <div style={{ maxWidth: 540, margin: "0 auto" }}>
+        {/* 戻るボタン */}
+        {onClose && (
+          <button
+            onClick={onClose}
+            style={{
+              background: "none",
+              color: T.inkSoft,
+              fontSize: 13,
+              padding: "4px 0",
+              marginBottom: 12,
+            }}
+          >
+            ← 戻る
+          </button>
+        )}
+
+        {/* ヒーロー */}
+        <div
+          style={{
+            background: T.bgDark,
+            color: T.surface,
+            borderRadius: 16,
+            padding: "20px 22px",
+            marginBottom: 18,
+          }}
+        >
+          <div
+            className="mono"
+            style={{
+              fontSize: 10,
+              letterSpacing: ".22em",
+              color: T.accent,
+              textTransform: "uppercase",
+              fontWeight: 700,
+              marginBottom: 8,
+            }}
+          >
+            Genki.B.C · Session Result
+          </div>
+          <div
+            style={{
+              fontSize: 26,
+              fontWeight: 900,
+              letterSpacing: "-.02em",
+              marginBottom: 4,
+              lineHeight: 1.2,
+            }}
+          >
+            {session.name}
+          </div>
+          <div
+            className="mono"
+            style={{
+              fontSize: 11,
+              opacity: 0.65,
+              marginBottom: 14,
+            }}
+          >
+            {dateStr}
+          </div>
+          <div
+            style={{
+              display: "flex",
+              gap: 18,
+              paddingTop: 12,
+              borderTop: "1px solid rgba(255,255,255,.15)",
+            }}
+          >
+            <div>
+              <div className="mono" style={{ fontSize: 22, fontWeight: 700, color: T.accent, lineHeight: 1 }}>
+                {players.length}
+              </div>
+              <div style={{ fontSize: 9, opacity: 0.55, marginTop: 3, letterSpacing: ".1em", textTransform: "uppercase" }}>
+                参加者
+              </div>
+            </div>
+            <div>
+              <div className="mono" style={{ fontSize: 22, fontWeight: 700, color: T.accent, lineHeight: 1 }}>
+                {history.length}
+              </div>
+              <div style={{ fontSize: 9, opacity: 0.55, marginTop: 3, letterSpacing: ".1em", textTransform: "uppercase" }}>
+                試合数
+              </div>
+            </div>
+            {hasAnyCost && (
+              <div style={{ marginLeft: "auto", textAlign: "right" }}>
+                <div className="mono" style={{ fontSize: 22, fontWeight: 700, color: T.accent, lineHeight: 1 }}>
+                  ¥{perPersonRounded.toLocaleString()}
+                </div>
+                <div style={{ fontSize: 9, opacity: 0.55, marginTop: 3, letterSpacing: ".1em", textTransform: "uppercase" }}>
+                  1人あたり
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* 共有URLボタン(管理者のみ) */}
+        {!IS_PLAYER_VIEW && !isShareMode && (
+          <div
+            style={{
+              background: T.surface,
+              border: `1.5px solid ${T.primary}`,
+              borderRadius: 12,
+              padding: 12,
+              marginBottom: 18,
+            }}
+          >
+            <div className="mono" style={{ fontSize: 10, letterSpacing: ".15em", color: T.primary, fontWeight: 700, marginBottom: 6, textTransform: "uppercase" }}>
+              📤 参加者に共有
+            </div>
+            <div style={{ fontSize: 11, color: T.inkSoft, marginBottom: 8, lineHeight: 1.5 }}>
+              このURLを送ると、参加者もこの結果画面を見られます
+            </div>
+            <div
+              className="mono"
+              style={{
+                fontSize: 10,
+                color: T.inkSoft,
+                wordBreak: "break-all",
+                padding: "8px 10px",
+                background: T.surfaceWarm,
+                borderRadius: 6,
+                marginBottom: 8,
+                lineHeight: 1.5,
+                border: `1px solid ${T.lineSoft}`,
+              }}
+            >
+              {shareUrl}
+            </div>
+            <button
+              onClick={copyShareUrl}
+              style={{
+                width: "100%",
+                padding: "10px",
+                background: copied ? T.primary : T.surface,
+                border: `1.5px solid ${T.primary}`,
+                borderRadius: 8,
+                color: copied ? T.surface : T.primary,
+                fontSize: 12,
+                fontWeight: 700,
+              }}
+            >
+              {copied ? "✓ コピーしました" : "📋 URLをコピー"}
+            </button>
+          </div>
+        )}
+
+        {/* 開催メモ */}
+        {notes.trim() && (
+          <div style={{ marginBottom: 18 }}>
+            <SectionTitle>📝 開催メモ</SectionTitle>
+            <div
+              style={{
+                background: T.surface,
+                border: `1px solid ${T.line}`,
+                borderRadius: 12,
+                padding: "12px 14px",
+                fontSize: 13,
+                lineHeight: 1.7,
+                whiteSpace: "pre-wrap",
+                color: T.ink,
+              }}
+            >
+              {notes}
+            </div>
+          </div>
+        )}
+
+        {/* 費用 */}
+        {hasAnyCost && (
+          <div style={{ marginBottom: 18 }}>
+            <SectionTitle>💰 本日の費用</SectionTitle>
+            <div
+              style={{
+                background: T.surface,
+                border: `1px solid ${T.line}`,
+                borderRadius: 12,
+                padding: 14,
+              }}
+            >
+              <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12 }}>
+                {gymTotal > 0 && (
+                  <div style={{ display: "flex" }}>
+                    <span style={{ flex: 1, color: T.inkSoft }}>
+                      体育館代 (¥{cost.gymRate}/h × {cost.gymCourts}面 × {cost.gymHours}h)
+                    </span>
+                    <span className="mono" style={{ fontWeight: 700, color: T.ink }}>
+                      ¥{gymTotal.toLocaleString()}
+                    </span>
+                  </div>
+                )}
+                {shuttle > 0 && (
+                  <div style={{ display: "flex" }}>
+                    <span style={{ flex: 1, color: T.inkSoft }}>シャトル代</span>
+                    <span className="mono" style={{ fontWeight: 700, color: T.ink }}>
+                      ¥{shuttle.toLocaleString()}
+                    </span>
+                  </div>
+                )}
+                {(cost.otherItems || []).filter(it => Number(it.amount) > 0).map((it, i) => (
+                  <div key={i} style={{ display: "flex" }}>
+                    <span style={{ flex: 1, color: T.inkSoft }}>{it.label || "その他"}</span>
+                    <span className="mono" style={{ fontWeight: 700, color: T.ink }}>
+                      ¥{Number(it.amount).toLocaleString()}
+                    </span>
+                  </div>
+                ))}
+                <div
+                  style={{
+                    display: "flex",
+                    marginTop: 8,
+                    paddingTop: 8,
+                    borderTop: `1px solid ${T.lineSoft}`,
+                    fontSize: 14,
+                  }}
+                >
+                  <span style={{ flex: 1, fontWeight: 700 }}>合計</span>
+                  <span className="mono" style={{ fontWeight: 700, color: T.ink, fontSize: 16 }}>
+                    ¥{total.toLocaleString()}
+                  </span>
+                </div>
+                <div style={{ display: "flex", marginTop: 2 }}>
+                  <span style={{ flex: 1, color: T.inkSoft, fontSize: 11 }}>
+                    ÷ {actualParticipants}人
+                  </span>
+                </div>
+              </div>
+
+              {/* 1人あたり */}
+              <div
+                style={{
+                  marginTop: 12,
+                  paddingTop: 12,
+                  borderTop: `2px solid ${T.primary}`,
+                  display: "flex",
+                  alignItems: "baseline",
+                  gap: 14,
+                }}
+              >
+                <div>
+                  <div className="mono" style={{ fontSize: 11, color: T.inkSoft }}>1円単位</div>
+                  <div className="mono" style={{ fontSize: 20, fontWeight: 700, color: T.ink, lineHeight: 1.1 }}>
+                    ¥{Math.round(perPerson).toLocaleString()}
+                  </div>
+                </div>
+                <div style={{ flex: 1, textAlign: "right" }}>
+                  <div className="mono" style={{ fontSize: 11, color: T.primary, fontWeight: 700 }}>
+                    ¥{roundUnit}単位で集める額
+                  </div>
+                  <div className="mono" style={{ fontSize: 26, fontWeight: 900, color: T.primary, lineHeight: 1.1 }}>
+                    ¥{perPersonRounded.toLocaleString()}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* 参加者 */}
+        <SectionTitle>参加者 · {players.length}人</SectionTitle>
+        <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 18 }}>
+          {players.map((p, i) => {
+            const games = playCount[p.id] || 0;
+            const wins = p.wins || 0;
+            const losses = p.losses || 0;
+            const totalG = wins + losses;
+            const rate = totalG > 0 ? Math.round((wins / totalG) * 100) : 0;
+            return (
+              <div
+                key={p.id}
+                style={{
+                  background: T.surface,
+                  border: `1px solid ${T.line}`,
+                  borderRadius: 10,
+                  padding: "10px 12px",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 10,
+                }}
+              >
+                <span
+                  className="mono"
+                  style={{
+                    width: 24,
+                    height: 24,
+                    borderRadius: 6,
+                    background: T.primary,
+                    color: T.surface,
+                    fontSize: 10,
+                    fontWeight: 700,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    flexShrink: 0,
+                  }}
+                >
+                  {String(i + 1).padStart(2, "0")}
+                </span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: T.ink }}>
+                    {p.name}
+                  </div>
+                  {p.yomi && (
+                    <div className="mono" style={{ fontSize: 9, color: T.inkSoft }}>
+                      {p.yomi}
+                    </div>
+                  )}
+                </div>
+                <span className="mono" style={{ fontSize: 11, color: T.inkSoft, flexShrink: 0 }}>
+                  {games}試合 · {wins}W·{losses}L
+                </span>
+                {totalG > 0 && (
+                  <span
+                    className="mono"
+                    style={{
+                      fontSize: 13,
+                      fontWeight: 700,
+                      color: rate >= 50 ? T.primary : T.inkSoft,
+                      minWidth: 38,
+                      textAlign: "right",
+                    }}
+                  >
+                    {rate}%
+                  </span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* ランキング */}
+        {ranked && ranked.length > 0 && (
+          <div style={{ marginBottom: 18 }}>
+            <SectionTitle>🏆 ランキング</SectionTitle>
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              {ranked.map((p, i) => {
+                const totalG = (p.wins || 0) + (p.losses || 0);
+                const rate = totalG > 0 ? Math.round((p.wins / totalG) * 100) : 0;
+                const medals = ["①", "②", "③"];
+                return (
+                  <div
+                    key={p.id}
+                    style={{
+                      background: T.surface,
+                      border: `1px solid ${i < 3 ? T.primary : T.line}`,
+                      borderRadius: 10,
+                      padding: "10px 14px",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 10,
+                    }}
+                  >
+                    <span
+                      style={{
+                        fontSize: 16,
+                        color: T.primary,
+                        fontWeight: 700,
+                        width: 24,
+                        textAlign: "center",
+                        flexShrink: 0,
+                      }}
+                    >
+                      {medals[i] || `${i + 1}`}
+                    </span>
+                    <span style={{ flex: 1, fontSize: 14, fontWeight: 700, color: T.ink }}>
+                      {p.name}
+                    </span>
+                    <span className="mono" style={{ fontSize: 11, color: T.inkSoft }}>
+                      {p.wins || 0}W·{p.losses || 0}L
+                    </span>
+                    <span
+                      className="mono"
+                      style={{
+                        fontSize: 13,
+                        fontWeight: 700,
+                        color: T.primary,
+                        minWidth: 38,
+                        textAlign: "right",
+                      }}
+                    >
+                      {rate}%
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* 試合履歴 */}
+        <SectionTitle>全試合 · {history.length}件</SectionTitle>
+        {history.length === 0 ? (
+          <div
+            style={{
+              padding: 14,
+              background: T.surface,
+              border: `1px solid ${T.line}`,
+              borderRadius: 10,
+              fontSize: 12,
+              color: T.inkSoft,
+              textAlign: "center",
+              fontStyle: "italic",
+              marginBottom: 18,
+            }}
+          >
+            試合履歴がありません
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 18 }}>
+            {history.map((h, i) => {
+              const winnerTeam = h.winner === 1 ? h.team1 : h.winner === 2 ? h.team2 : null;
+              return (
+                <div
+                  key={h.id}
+                  style={{
+                    background: T.surface,
+                    border: `1px solid ${T.line}`,
+                    borderRadius: 10,
+                    padding: "10px 12px",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                  }}
+                >
+                  <span
+                    className="mono"
+                    style={{
+                      fontSize: 10,
+                      color: T.inkSoft,
+                      minWidth: 24,
+                    }}
+                  >
+                    {String(i + 1).padStart(2, "0")}
+                  </span>
+                  <span
+                    className="mono"
+                    style={{
+                      background: T.primary,
+                      color: T.surface,
+                      fontSize: 10,
+                      padding: "3px 6px",
+                      borderRadius: 5,
+                      fontWeight: 700,
+                      flexShrink: 0,
+                    }}
+                  >
+                    C{h.court}
+                  </span>
+                  <div
+                    style={{
+                      flex: 1,
+                      fontSize: 12,
+                      minWidth: 0,
+                      color: h.winner === 1 ? T.primary : T.ink,
+                      fontWeight: h.winner === 1 ? 700 : 500,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                    }}
+                  >
+                    {h.team1.map((p) => p.name).join("·")}
+                  </div>
+                  <span style={{ fontSize: 10, color: T.inkSoft }}>vs</span>
+                  <div
+                    style={{
+                      flex: 1,
+                      fontSize: 12,
+                      minWidth: 0,
+                      color: h.winner === 2 ? T.primary : T.ink,
+                      fontWeight: h.winner === 2 ? 700 : 500,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      textAlign: "right",
+                    }}
+                  >
+                    {h.team2.map((p) => p.name).join("·")}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* フッター */}
+        <div
+          style={{
+            textAlign: "center",
+            color: T.inkSoft,
+            fontSize: 10,
+            marginTop: 28,
+            paddingTop: 16,
+            borderTop: `1px solid ${T.lineSoft}`,
+            fontFamily: "Menlo, monospace",
+          }}
+        >
+          Generated by Genki.B.C Badminton Manager
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// 参加者数を集計するヘルパー
+function computePlayCount(session) {
+  const result = {};
+  (session.history || []).forEach((h) => {
+    [...h.team1, ...h.team2].forEach((p) => {
+      result[p.id] = (result[p.id] || 0) + 1;
+    });
+  });
+  return result;
+}
+
+// ランキング(勝率順)を計算するヘルパー
+function computeRanked(session) {
+  return (session.players || [])
+    .filter((p) => (p.wins || 0) + (p.losses || 0) > 0)
+    .map((p) => ({
+      ...p,
+      rate: (p.wins || 0) / ((p.wins || 0) + (p.losses || 0)),
+    }))
+    .sort((a, b) => {
+      if (b.rate !== a.rate) return b.rate - a.rate;
+      return (b.wins || 0) - (a.wins || 0);
+    })
+    .slice(0, 5); // トップ5まで
+}
+
 // ── セッション詳細 ──
-function SessionDetailView({ session, onBack, onDelete, onRename, onEditMatch, onDeleteMatch, onDeletePlayer }) {
+function SessionDetailView({ session, ctx, onBack, onDelete, onRename, onEditMatch, onDeleteMatch, onDeletePlayer }) {
   const [editMode, setEditMode] = useState(false);
   const [nameDraft, setNameDraft] = useState(session.name);
   const [openMatchMenuId, setOpenMatchMenuId] = useState(null);
   const [showPdf, setShowPdf] = useState(false);
+  const [showResult, setShowResult] = useState(false);
 
   // session が変わったら nameDraft も同期
   useEffect(() => {
@@ -7190,6 +8348,17 @@ function SessionDetailView({ session, onBack, onDelete, onRename, onEditMatch, o
     if (nameDraft.trim() && nameDraft.trim() !== session.name) {
       onRename(nameDraft.trim());
     }
+  }
+
+  // 結果共有画面を全画面表示
+  if (showResult) {
+    return (
+      <SessionResultView
+        session={session}
+        ctx={ctx}
+        onClose={() => setShowResult(false)}
+      />
+    );
   }
 
   return (
@@ -7246,6 +8415,29 @@ function SessionDetailView({ session, onBack, onDelete, onRename, onEditMatch, o
           {editMode ? "✓ 完了" : "✎ 編集"}
         </button>
       </div>
+
+      {/* 結果を見る・共有ボタン(目立つ) */}
+      <button
+        onClick={() => setShowResult(true)}
+        style={{
+          width: "100%",
+          padding: "13px",
+          background: T.primary,
+          border: "none",
+          borderRadius: 12,
+          color: T.surface,
+          fontSize: 14,
+          fontWeight: 700,
+          marginBottom: 16,
+          boxShadow: "0 4px 14px rgba(10,135,84,.25)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: 8,
+        }}
+      >
+        📊 結果を見る・参加者に共有
+      </button>
 
       <div
         style={{
