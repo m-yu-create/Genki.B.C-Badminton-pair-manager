@@ -660,6 +660,125 @@ function getResultSessionId() {
 }
 
 // ═══════════════════════════════════════════════════════════
+// 読み上げ(音声合成) — Web Speech API
+// 端末が非対応でもエラーにならないよう、存在チェックを徹底
+// ═══════════════════════════════════════════════════════════
+
+// この端末で音声合成が使えるか
+function speechSupported() {
+  try {
+    return (
+      typeof window !== "undefined" &&
+      "speechSynthesis" in window &&
+      typeof window.SpeechSynthesisUtterance !== "undefined"
+    );
+  } catch (e) {
+    return false;
+  }
+}
+
+const VOICE_PREF_KEY = "bm-voice-uri-v1";
+
+// 利用可能な日本語の声を取得するフック
+// 戻り値: { voices, ready }
+function useJapaneseVoices() {
+  const [voices, setVoices] = useState([]);
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    if (!speechSupported()) {
+      setReady(true);
+      return;
+    }
+    let cancelled = false;
+
+    function load() {
+      try {
+        const all = window.speechSynthesis.getVoices() || [];
+        // 日本語の声を優先。なければ全部。
+        const ja = all.filter(
+          (v) => v.lang && (v.lang.toLowerCase().startsWith("ja") || v.lang === "ja-JP")
+        );
+        const list = ja.length > 0 ? ja : all;
+        if (!cancelled) {
+          setVoices(list);
+          setReady(true);
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setVoices([]);
+          setReady(true);
+        }
+      }
+    }
+
+    load();
+    // 声のリストは非同期で読み込まれることがある(特にChrome)
+    try {
+      window.speechSynthesis.onvoiceschanged = load;
+    } catch (e) {}
+    // 念のため遅延でも一度試す
+    const t = setTimeout(load, 400);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+      try {
+        if (window.speechSynthesis) window.speechSynthesis.onvoiceschanged = null;
+      } catch (e) {}
+    };
+  }, []);
+
+  return { voices, ready };
+}
+
+// テキストを読み上げる(voiceURI 指定可)
+function speak(text, voiceURI) {
+  if (!speechSupported() || !text) return false;
+  try {
+    // 読み上げ中なら一旦止める
+    window.speechSynthesis.cancel();
+    const u = new window.SpeechSynthesisUtterance(text);
+    u.lang = "ja-JP";
+    u.rate = 1.0;
+    u.pitch = 1.0;
+    if (voiceURI) {
+      const all = window.speechSynthesis.getVoices() || [];
+      const v = all.find((x) => x.voiceURI === voiceURI);
+      if (v) u.voice = v;
+    }
+    window.speechSynthesis.speak(u);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// 試合状況を読み上げ用テキストに組み立てる
+// matches: 現在の試合, restingNames: 休憩中の名前配列, waitingNames: 待機中の名前配列
+function buildAnnounceText(matches, restingNames, waitingNames) {
+  const parts = [];
+  const sorted = [...(matches || [])].sort((a, b) => a.court - b.court);
+  sorted.forEach((m) => {
+    const t1 = (m.team1 || []).map((p) => p.name).join("、");
+    const t2 = (m.team2 || []).map((p) => p.name).join("、");
+    if (m.singles) {
+      parts.push(`コート${m.court}、${t1} 対 ${t2}`);
+    } else {
+      parts.push(`コート${m.court}、${t1} 組 対 ${t2} 組`);
+    }
+  });
+  if (restingNames && restingNames.length > 0) {
+    parts.push(`休憩は、${restingNames.join("、")}さんです`);
+  }
+  if (waitingNames && waitingNames.length > 0) {
+    parts.push(`次の待機は、${waitingNames.join("、")}さんです`);
+  }
+  if (parts.length === 0) return "進行中の試合はありません";
+  return parts.join("。");
+}
+
+// ═══════════════════════════════════════════════════════════
 // App-level passphrase (entry password)
 // ═══════════════════════════════════════════════════════════
 const APP_PASSPHRASE = "げんきばど";
@@ -3499,6 +3618,175 @@ function JoinSelect({ ctx }) {
 // ═══════════════════════════════════════════════════════════
 // STATUS (live match view)
 // ═══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+// AnnounceButton — 🔊試合の組み合わせを読み上げ
+// 端末が音声合成に非対応なら何も表示しない(エラーにしない)
+// ═══════════════════════════════════════════════════════════
+function AnnounceButton({ matches, restingNames, waitingNames }) {
+  const supported = speechSupported();
+  const { voices, ready } = useJapaneseVoices();
+  const [showVoicePicker, setShowVoicePicker] = useState(false);
+  const [voiceURI, setVoiceURI] = useState(() => {
+    try {
+      return localStorage.getItem(VOICE_PREF_KEY) || "";
+    } catch (e) {
+      return "";
+    }
+  });
+  const [speaking, setSpeaking] = useState(false);
+
+  // 非対応端末では何も出さない
+  if (!supported) return null;
+
+  function handleAnnounce() {
+    const text = buildAnnounceText(matches, restingNames, waitingNames);
+    const ok = speak(text, voiceURI);
+    if (ok) {
+      setSpeaking(true);
+      // 読み上げ終了を検知
+      try {
+        window.speechSynthesis.addEventListener(
+          "end",
+          () => setSpeaking(false),
+          { once: true }
+        );
+      } catch (e) {}
+      // 保険: 一定時間後にフラグを戻す
+      setTimeout(() => setSpeaking(false), 15000);
+    }
+  }
+
+  function handleStop() {
+    try {
+      window.speechSynthesis.cancel();
+    } catch (e) {}
+    setSpeaking(false);
+  }
+
+  function pickVoice(uri) {
+    setVoiceURI(uri);
+    try {
+      localStorage.setItem(VOICE_PREF_KEY, uri);
+    } catch (e) {}
+    // 選んだ声でサンプル読み上げ
+    speak("コート1、テスト読み上げです", uri);
+    setShowVoicePicker(false);
+  }
+
+  // 声の表示名(男女が判別できる場合は付記)
+  function voiceLabel(v) {
+    let name = v.name || v.voiceURI;
+    // よくある日本語音声の男女ヒント
+    const lower = name.toLowerCase();
+    if (lower.includes("kyoko") || lower.includes("o-ren") || lower.includes("female")) {
+      return `${name}（女声）`;
+    }
+    if (lower.includes("otoya") || lower.includes("hattori") || lower.includes("male")) {
+      return `${name}（男声）`;
+    }
+    return name;
+  }
+
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ display: "flex", gap: 6 }}>
+        <button
+          onClick={speaking ? handleStop : handleAnnounce}
+          style={{
+            flex: 1,
+            padding: "11px",
+            background: speaking ? T.dangerSoft : T.surface,
+            border: `1.5px solid ${speaking ? T.danger : T.primary}`,
+            borderRadius: 12,
+            color: speaking ? T.danger : T.primary,
+            fontSize: 13,
+            fontWeight: 700,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 8,
+          }}
+        >
+          {speaking ? "■ 読み上げを止める" : "🔊 組み合わせを読み上げ"}
+        </button>
+        {voices.length > 1 && (
+          <button
+            onClick={() => setShowVoicePicker((s) => !s)}
+            title="声を選ぶ"
+            style={{
+              padding: "11px 14px",
+              background: T.surface,
+              border: `1px solid ${T.line}`,
+              borderRadius: 12,
+              color: T.inkSoft,
+              fontSize: 13,
+              fontWeight: 700,
+              flexShrink: 0,
+            }}
+          >
+            声 ▾
+          </button>
+        )}
+      </div>
+
+      {/* 声の選択 */}
+      {showVoicePicker && (
+        <div
+          style={{
+            marginTop: 6,
+            background: T.surfaceWarm,
+            border: `1px solid ${T.line}`,
+            borderRadius: 10,
+            padding: 6,
+            maxHeight: 200,
+            overflowY: "auto",
+          }}
+        >
+          <div
+            className="mono"
+            style={{
+              fontSize: 9,
+              letterSpacing: ".12em",
+              textTransform: "uppercase",
+              color: T.inkSoft,
+              fontWeight: 700,
+              padding: "4px 6px 6px",
+            }}
+          >
+            声を選ぶ（タップで試聴）
+          </div>
+          {voices.map((v) => (
+            <button
+              key={v.voiceURI}
+              onClick={() => pickVoice(v.voiceURI)}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                width: "100%",
+                padding: "9px 10px",
+                background: v.voiceURI === voiceURI ? T.primarySoft : T.surface,
+                border: `1px solid ${v.voiceURI === voiceURI ? T.primary : T.line}`,
+                borderRadius: 8,
+                color: T.ink,
+                fontSize: 12,
+                fontWeight: 600,
+                marginBottom: 4,
+                textAlign: "left",
+              }}
+            >
+              <span style={{ flex: 1 }}>{voiceLabel(v)}</span>
+              {v.voiceURI === voiceURI && (
+                <span style={{ color: T.primary, fontWeight: 700 }}>✓</span>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Status({ ctx }) {
   const {
     players,
@@ -3722,6 +4010,13 @@ function Status({ ctx }) {
                 : `進行中 · ${matches.length} courts`
             }
           >
+            <AnnounceButton
+              matches={matches}
+              restingNames={players
+                .filter((p) => (d.restingIds || []).includes(p.id))
+                .map((p) => p.name)}
+              waitingNames={waiting.map((p) => p.name)}
+            />
             {[...matches]
               .sort((a, b) => {
                 // 新試合を先頭に
@@ -5157,7 +5452,17 @@ function Admin({ ctx }) {
                 {matches.length === 0 && waiting.length === 0 ? (
                   <Empty title="全試合完了" sub="参加者を追加して再開できます" />
                 ) : (
-                  [...matches]
+                  <>
+                  {matches.length > 0 && (
+                    <AnnounceButton
+                      matches={matches}
+                      restingNames={players
+                        .filter((p) => (d.restingIds || []).includes(p.id))
+                        .map((p) => p.name)}
+                      waitingNames={waiting.map((p) => p.name)}
+                    />
+                  )}
+                  {[...matches]
                     .sort((a, b) => {
                       const an = newIds.has(a.id) ? 0 : 1;
                       const bn = newIds.has(b.id) ? 0 : 1;
@@ -5176,7 +5481,8 @@ function Admin({ ctx }) {
                         allPlayers={players}
                         allMatches={matches}
                       />
-                    ))
+                    ))}
+                  </>
               )}
               {waiting.length > 0 && (
                 <div
