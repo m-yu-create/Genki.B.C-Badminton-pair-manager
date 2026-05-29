@@ -4422,19 +4422,27 @@ function MCard({ match, onFinish, myPlayer, isNew, onSwap, allPlayers, allMatche
 function SwapPanel({ match, allPlayers, allMatches, swapTargetId, setSwapTargetId, onSwap, onClose }) {
   const inMatchPlayers = [...match.team1, ...match.team2];
 
-  // 候補リスト: 全参加者から「この試合の現メンバー」を除外
-  const candidates = allPlayers.filter(
-    (p) => !inMatchPlayers.some((x) => x.id === p.id)
-  );
-
   // 各候補のステータスを判定
   function statusOf(playerId) {
     const otherMatch = allMatches.find(
       (m) => m.id !== match.id && [...m.team1, ...m.team2].some((p) => p.id === playerId)
     );
-    if (otherMatch) return { type: "playing", label: `Court ${otherMatch.court}` };
-    return { type: "free", label: "待機/休み" };
+    if (otherMatch) return { type: "playing", label: `コート${otherMatch.court}`, court: otherMatch.court };
+    return { type: "free", label: "待機中", court: null };
   }
+
+  // 候補リスト: 全参加者から「この試合の現メンバー」を除外
+  const allCandidates = allPlayers.filter(
+    (p) => !inMatchPlayers.some((x) => x.id === p.id)
+  );
+
+  // 待機中の人 / 他コートの人 で分ける
+  const freeCandidates = allCandidates.filter((p) => statusOf(p.id).type === "free");
+  const playingCandidates = allCandidates
+    .filter((p) => statusOf(p.id).type === "playing")
+    .sort((a, b) => statusOf(a.id).court - statusOf(b.id).court);
+  // 表示順: 待機中が先、その後に他コートの人
+  const candidates = [...freeCandidates, ...playingCandidates];
 
   // ステップ1: 試合内で交代する人を選ぶ
   if (!swapTargetId) {
@@ -4498,12 +4506,23 @@ function SwapPanel({ match, allPlayers, allMatches, swapTargetId, setSwapTargetI
           color: T.inkSoft,
           fontSize: 12,
           textAlign: "center",
-          marginBottom: 8,
+          marginBottom: 2,
           fontWeight: 600,
         }}
       >
         <span style={{ color: T.primary, fontWeight: 700 }}>{targetPlayer?.name}</span>
         {" → 誰に交代?"}
+      </div>
+      <div
+        style={{
+          color: T.inkSoft,
+          fontSize: 10,
+          textAlign: "center",
+          marginBottom: 8,
+          opacity: 0.75,
+        }}
+      >
+        他コートの人を選べば、その場でお互い入れ替わります
       </div>
       {candidates.length === 0 ? (
         <div
@@ -4523,59 +4542,85 @@ function SwapPanel({ match, allPlayers, allMatches, swapTargetId, setSwapTargetI
       ) : (
         <div
           style={{
-            maxHeight: 220,
+            maxHeight: 320,
             overflowY: "auto",
             display: "flex",
             flexDirection: "column",
             gap: 4,
             marginBottom: 8,
-            padding: 4,
+            padding: 6,
             background: T.surfaceWarm,
             borderRadius: 10,
           }}
         >
-          {candidates.map((p) => {
-            const st = statusOf(p.id);
-            return (
-              <button
-                key={p.id}
-                onClick={() => {
-                  onSwap(match.id, swapTargetId, p.id);
-                  onClose();
-                }}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  padding: "10px 12px",
-                  background: T.surface,
-                  border: `1px solid ${T.line}`,
-                  borderRadius: 9,
-                  color: T.ink,
-                  fontSize: 13,
-                  fontWeight: 600,
-                  textAlign: "left",
-                }}
-              >
-                <span style={{ flex: 1 }}>{p.name}</span>
-                <span
-                  className="mono"
+          {(() => {
+            const renderBtn = (p) => {
+              const st = statusOf(p.id);
+              return (
+                <button
+                  key={p.id}
+                  onClick={() => {
+                    onSwap(match.id, swapTargetId, p.id);
+                    onClose();
+                  }}
                   style={{
-                    fontSize: 10,
-                    padding: "2px 8px",
-                    borderRadius: 999,
-                    background: st.type === "playing" ? T.primarySoft : T.warnSoft,
-                    color: st.type === "playing" ? T.primary : T.warn,
-                    border: `1px solid ${st.type === "playing" ? T.primary : T.warn}`,
-                    fontWeight: 700,
-                    flexShrink: 0,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    padding: "10px 12px",
+                    background: T.surface,
+                    border: `1px solid ${st.type === "playing" ? T.primary : T.line}`,
+                    borderRadius: 9,
+                    color: T.ink,
+                    fontSize: 13,
+                    fontWeight: 600,
+                    textAlign: "left",
+                    width: "100%",
                   }}
                 >
-                  {st.label}
-                </span>
-              </button>
+                  <span style={{ flex: 1 }}>{p.name}</span>
+                  <span
+                    className="mono"
+                    style={{
+                      fontSize: 10,
+                      padding: "2px 8px",
+                      borderRadius: 999,
+                      background: st.type === "playing" ? T.primarySoft : T.warnSoft,
+                      color: st.type === "playing" ? T.primary : T.warn,
+                      border: `1px solid ${st.type === "playing" ? T.primary : T.warn}`,
+                      fontWeight: 700,
+                      flexShrink: 0,
+                    }}
+                  >
+                    {st.type === "playing" ? `↔ ${st.label}` : st.label}
+                  </span>
+                </button>
+              );
+            };
+            const sectionHead = (text) => (
+              <div
+                className="mono"
+                style={{
+                  fontSize: 9,
+                  letterSpacing: ".12em",
+                  textTransform: "uppercase",
+                  color: T.inkSoft,
+                  fontWeight: 700,
+                  padding: "4px 4px 2px",
+                }}
+              >
+                {text}
+              </div>
             );
-          })}
+            return (
+              <>
+                {freeCandidates.length > 0 && sectionHead("待機中から選ぶ")}
+                {freeCandidates.map(renderBtn)}
+                {playingCandidates.length > 0 && sectionHead("他コートと入れ替え")}
+                {playingCandidates.map(renderBtn)}
+              </>
+            );
+          })()}
         </div>
       )}
       <div style={{ display: "flex", gap: 6 }}>
@@ -7425,9 +7470,9 @@ function exportSessionPDF(session, playCount, ranked, dateStr) {
       return `<tr>
         <td class="num">${String(idx + 1).padStart(2, "0")}</td>
         <td class="court">C${m.court}</td>
-        <td class="team winner">${wt.map((p) => escapeHtml(p.name)).join(" / ")}</td>
+        <td class="team winner">${wt.map((p) => escapeHtml(p.name)).join("<br>")}</td>
         <td class="vs">vs</td>
-        <td class="team">${lt.map((p) => escapeHtml(p.name)).join(" / ")}</td>
+        <td class="team">${lt.map((p) => escapeHtml(p.name)).join("<br>")}</td>
       </tr>`;
     })
     .join("");
@@ -8307,30 +8352,56 @@ function SessionResultView({ session, ctx, onClose, isShareMode }) {
                   <div
                     style={{
                       flex: 1,
-                      fontSize: 12,
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
                       minWidth: 0,
-                      color: h.winner === 1 ? T.primary : T.ink,
-                      fontWeight: h.winner === 1 ? 700 : 500,
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
                     }}
                   >
-                    {h.team1.map((p) => p.name).join("·")}
-                  </div>
-                  <span style={{ fontSize: 10, color: T.inkSoft }}>vs</span>
-                  <div
-                    style={{
-                      flex: 1,
-                      fontSize: 12,
-                      minWidth: 0,
-                      color: h.winner === 2 ? T.primary : T.ink,
-                      fontWeight: h.winner === 2 ? 700 : 500,
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      textAlign: "right",
-                    }}
-                  >
-                    {h.team2.map((p) => p.name).join("·")}
+                    {/* team1(縦並び) */}
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      {h.team1.map((p, idx) => (
+                        <div
+                          key={idx}
+                          style={{
+                            fontSize: 13,
+                            lineHeight: 1.45,
+                            color: h.winner === 1 ? T.primary : T.ink,
+                            fontWeight: h.winner === 1 ? 700 : 500,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {p.name}
+                        </div>
+                      ))}
+                    </div>
+                    <span
+                      className="mono"
+                      style={{ fontSize: 9, color: T.inkSoft, flexShrink: 0, opacity: 0.7 }}
+                    >
+                      vs
+                    </span>
+                    {/* team2(縦並び) */}
+                    <div style={{ flex: 1, minWidth: 0, textAlign: "right" }}>
+                      {h.team2.map((p, idx) => (
+                        <div
+                          key={idx}
+                          style={{
+                            fontSize: 13,
+                            lineHeight: 1.45,
+                            color: h.winner === 2 ? T.primary : T.ink,
+                            fontWeight: h.winner === 2 ? 700 : 500,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {p.name}
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 </div>
               );
@@ -8905,13 +8976,65 @@ function SessionDetailView({ session, ctx, onBack, onDelete, onRename, onEditMat
                   >
                     C{m.court}
                   </span>
-                  <div style={{ flex: 1, fontSize: 12, lineHeight: 1.4, minWidth: 0 }}>
-                    <span style={{ color: T.primary, fontWeight: 700 }}>
-                      {wt.map((p) => p.name).join(" / ")}
+                  <div
+                    style={{
+                      flex: 1,
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      minWidth: 0,
+                    }}
+                  >
+                    {/* 勝ちチーム(縦並び) */}
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      {wt.map((p, i) => (
+                        <div
+                          key={i}
+                          style={{
+                            fontSize: 13,
+                            fontWeight: 700,
+                            color: T.primary,
+                            lineHeight: 1.45,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {p.name}
+                        </div>
+                      ))}
+                    </div>
+                    {/* vs */}
+                    <span
+                      className="mono"
+                      style={{
+                        fontSize: 9,
+                        color: T.inkSoft,
+                        flexShrink: 0,
+                        opacity: 0.7,
+                      }}
+                    >
+                      vs
                     </span>
-                    <span style={{ color: T.inkSoft, fontSize: 11 }}>
-                      {" "}vs {lt.map((p) => p.name).join(" / ")}
-                    </span>
+                    {/* 負けチーム(縦並び) */}
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      {lt.map((p, i) => (
+                        <div
+                          key={i}
+                          style={{
+                            fontSize: 12,
+                            fontWeight: 500,
+                            color: T.inkSoft,
+                            lineHeight: 1.45,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {p.name}
+                        </div>
+                      ))}
+                    </div>
                   </div>
                   {editMode && (
                     <button
