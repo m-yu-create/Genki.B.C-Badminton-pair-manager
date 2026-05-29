@@ -755,27 +755,33 @@ function speak(text, voiceURI) {
 }
 
 // 試合状況を読み上げ用テキストに組み立てる
-// matches: 現在の試合, restingNames: 休憩中の名前配列, waitingNames: 待機中の名前配列
-function buildAnnounceText(matches, restingNames, waitingNames) {
+// matches: 現在の試合
+// restingPlayers / waitingPlayers: {id,name} の配列
+// readingOf(player): その選手の「読み」を返す関数(ふりがなあれば優先、なければ名前)
+function buildAnnounceText(matches, restingPlayers, waitingPlayers, readingOf) {
+  const read = typeof readingOf === "function" ? readingOf : (p) => p.name;
   const parts = [];
   const sorted = [...(matches || [])].sort((a, b) => a.court - b.court);
   sorted.forEach((m) => {
-    const t1 = (m.team1 || []).map((p) => p.name).join("、");
-    const t2 = (m.team2 || []).map((p) => p.name).join("、");
+    const t1 = (m.team1 || []).map((p) => read(p)).join("、");
+    const t2 = (m.team2 || []).map((p) => read(p)).join("、");
     if (m.singles) {
       parts.push(`コート${m.court}、${t1} 対 ${t2}`);
     } else {
       parts.push(`コート${m.court}、${t1} 組 対 ${t2} 組`);
     }
   });
-  if (restingNames && restingNames.length > 0) {
-    parts.push(`休憩は、${restingNames.join("、")}さんです`);
+  if (restingPlayers && restingPlayers.length > 0) {
+    parts.push(`休憩は、${restingPlayers.map((p) => read(p)).join("、")}さんです`);
   }
-  if (waitingNames && waitingNames.length > 0) {
-    parts.push(`次の待機は、${waitingNames.join("、")}さんです`);
+  if (waitingPlayers && waitingPlayers.length > 0) {
+    parts.push(`次の待機は、${waitingPlayers.map((p) => read(p)).join("、")}さんです`);
   }
   if (parts.length === 0) return "進行中の試合はありません";
-  return parts.join("。");
+  // 冒頭に一言入れる(コートがある時のみ)
+  const hasCourt = sorted.length > 0;
+  const intro = hasCourt ? "次の試合です。" : "";
+  return intro + parts.join("。");
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -3622,7 +3628,7 @@ function JoinSelect({ ctx }) {
 // AnnounceButton — 🔊試合の組み合わせを読み上げ
 // 端末が音声合成に非対応なら何も表示しない(エラーにしない)
 // ═══════════════════════════════════════════════════════════
-function AnnounceButton({ matches, restingNames, waitingNames }) {
+function AnnounceButton({ matches, restingPlayers, waitingPlayers, players }) {
   const supported = speechSupported();
   const { voices, ready } = useJapaneseVoices();
   const [showVoicePicker, setShowVoicePicker] = useState(false);
@@ -3638,8 +3644,24 @@ function AnnounceButton({ matches, restingNames, waitingNames }) {
   // 非対応端末では何も出さない
   if (!supported) return null;
 
+  // 読み解決: ふりがながあればそれ、なければ名前(漢字)
+  // matches内の選手は{id,name}のみなので、playersからidでyomiを引く
+  const yomiById = {};
+  (players || []).forEach((p) => {
+    if (p.yomi && p.yomi.trim()) yomiById[p.id] = p.yomi.trim();
+  });
+  function readingOf(pl) {
+    if (!pl) return "";
+    // idでふりがなを引く
+    if (pl.id && yomiById[pl.id]) return yomiById[pl.id];
+    // 選手オブジェクト自体がyomiを持っていれば使う
+    if (pl.yomi && pl.yomi.trim()) return pl.yomi.trim();
+    // なければ名前(漢字)
+    return pl.name;
+  }
+
   function handleAnnounce() {
-    const text = buildAnnounceText(matches, restingNames, waitingNames);
+    const text = buildAnnounceText(matches, restingPlayers, waitingPlayers, readingOf);
     const ok = speak(text, voiceURI);
     if (ok) {
       setSpeaking(true);
@@ -4012,10 +4034,11 @@ function Status({ ctx }) {
           >
             <AnnounceButton
               matches={matches}
-              restingNames={players
-                .filter((p) => (d.restingIds || []).includes(p.id))
-                .map((p) => p.name)}
-              waitingNames={waiting.map((p) => p.name)}
+              players={players}
+              restingPlayers={players.filter((p) =>
+                (d.restingIds || []).includes(p.id)
+              )}
+              waitingPlayers={waiting}
             />
             {[...matches]
               .sort((a, b) => {
@@ -5456,10 +5479,11 @@ function Admin({ ctx }) {
                   {matches.length > 0 && (
                     <AnnounceButton
                       matches={matches}
-                      restingNames={players
-                        .filter((p) => (d.restingIds || []).includes(p.id))
-                        .map((p) => p.name)}
-                      waitingNames={waiting.map((p) => p.name)}
+                      players={players}
+                      restingPlayers={players.filter((p) =>
+                        (d.restingIds || []).includes(p.id)
+                      )}
+                      waitingPlayers={waiting}
                     />
                   )}
                   {[...matches]
