@@ -1466,6 +1466,38 @@ function App() {
     showToast(`${oldP.name} → ${newP.name} に交代`);
   }
 
+  // 同じ試合(コート)内で、2人のポジションを入れ替える
+  // 例: 田中・佐藤 vs 鈴木・高橋 で 佐藤と鈴木を入れ替え → 田中・鈴木 vs 佐藤・高橋
+  function swapWithinMatch(matchId, playerAId, playerBId) {
+    if (playerAId === playerBId) return;
+    const target = matches.find((m) => m.id === matchId);
+    if (!target) return;
+    const pA = players.find((p) => p.id === playerAId);
+    const pB = players.find((p) => p.id === playerBId);
+    if (!pA || !pB) return;
+
+    // team1 / team2 内で、それぞれのIDを相手のplayerオブジェクトに置き換える
+    function swapInTeam(team) {
+      return team.map((p) => {
+        if (p.id === playerAId) return { id: pB.id, name: pB.name };
+        if (p.id === playerBId) return { id: pA.id, name: pA.name };
+        return p;
+      });
+    }
+
+    const nextMatches = matches.map((m) => {
+      if (m.id !== matchId) return m;
+      return {
+        ...m,
+        team1: swapInTeam(m.team1),
+        team2: swapInTeam(m.team2),
+      };
+    });
+
+    upd(() => ({ ...d, matches: nextMatches }));
+    showToast(`${pA.name} ⇄ ${pB.name} ポジション変更`);
+  }
+
   function resetAll() {
     if (!window.confirm("全データをリセットしますか？\n（参加者・試合・履歴がすべて削除されます）"))
       return;
@@ -1790,6 +1822,7 @@ function App() {
     editHistoryWinner,
     deleteHistoryMatch,
     swapPlayer,
+    swapWithinMatch,
     toggleResting,
     toggleSinglesMode,
     resetAll,
@@ -3480,6 +3513,7 @@ function Status({ ctx }) {
     editHistoryWinner,
     deleteHistoryMatch,
     swapPlayer,
+    swapWithinMatch,
     toggleResting,
     regenMatches,
     setMode,
@@ -3704,6 +3738,7 @@ function Status({ ctx }) {
                   myPlayer={myPlayer}
                   isNew={newIds.has(m.id)}
                   onSwap={swapPlayer}
+                  onSwapWithin={swapWithinMatch}
                   allPlayers={players}
                   allMatches={matches}
                 />
@@ -4149,7 +4184,7 @@ function Status({ ctx }) {
 // ═══════════════════════════════════════════════════════════
 // Match Card
 // ═══════════════════════════════════════════════════════════
-function MCard({ match, onFinish, myPlayer, isNew, onSwap, allPlayers, allMatches }) {
+function MCard({ match, onFinish, myPlayer, isNew, onSwap, onSwapWithin, allPlayers, allMatches }) {
   const [picking, setPicking] = useState(false);
   const [swapping, setSwapping] = useState(false); // メンバー変更モード
   const [swapTargetId, setSwapTargetId] = useState(null); // 変更したい試合内のplayer id
@@ -4406,6 +4441,7 @@ function MCard({ match, onFinish, myPlayer, isNew, onSwap, allPlayers, allMatche
           swapTargetId={swapTargetId}
           setSwapTargetId={setSwapTargetId}
           onSwap={onSwap}
+          onSwapWithin={onSwapWithin}
           onClose={() => {
             setSwapping(false);
             setSwapTargetId(null);
@@ -4419,7 +4455,7 @@ function MCard({ match, onFinish, myPlayer, isNew, onSwap, allPlayers, allMatche
 // ═══════════════════════════════════════════════════════════
 // SwapPanel — 試合中のメンバー変更UI
 // ═══════════════════════════════════════════════════════════
-function SwapPanel({ match, allPlayers, allMatches, swapTargetId, setSwapTargetId, onSwap, onClose }) {
+function SwapPanel({ match, allPlayers, allMatches, swapTargetId, setSwapTargetId, onSwap, onSwapWithin, onClose }) {
   const inMatchPlayers = [...match.team1, ...match.team2];
 
   // 各候補のステータスを判定
@@ -4443,6 +4479,16 @@ function SwapPanel({ match, allPlayers, allMatches, swapTargetId, setSwapTargetI
     .sort((a, b) => statusOf(a.id).court - statusOf(b.id).court);
   // 表示順: 待機中が先、その後に他コートの人
   const candidates = [...freeCandidates, ...playingCandidates];
+
+  // 同じコート内の、選択中の人以外の3人(ペア組み替え用)
+  const sameCourtCandidates = inMatchPlayers.filter((p) => p.id !== swapTargetId);
+
+  // 選択中の人がどちらのチームか(同コート相手の表示用)
+  function teamOf(playerId) {
+    if (match.team1.some((p) => p.id === playerId)) return 1;
+    if (match.team2.some((p) => p.id === playerId)) return 2;
+    return 0;
+  }
 
   // ステップ1: 試合内で交代する人を選ぶ
   if (!swapTargetId) {
@@ -4522,9 +4568,9 @@ function SwapPanel({ match, allPlayers, allMatches, swapTargetId, setSwapTargetI
           opacity: 0.75,
         }}
       >
-        他コートの人を選べば、その場でお互い入れ替わります
+        他コートや同じコートの人を選べば、その場で入れ替わります
       </div>
-      {candidates.length === 0 ? (
+      {candidates.length === 0 && sameCourtCandidates.length === 0 ? (
         <div
           style={{
             padding: 16,
@@ -4597,6 +4643,50 @@ function SwapPanel({ match, allPlayers, allMatches, swapTargetId, setSwapTargetI
                 </button>
               );
             };
+            // 同コート内ポジション組み替え用ボタン
+            const renderSameCourtBtn = (p) => {
+              const t = teamOf(p.id);
+              return (
+                <button
+                  key={"sc-" + p.id}
+                  onClick={() => {
+                    onSwapWithin && onSwapWithin(match.id, swapTargetId, p.id);
+                    onClose();
+                  }}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    padding: "10px 12px",
+                    background: T.surface,
+                    border: `1px solid ${T.accentDark}`,
+                    borderRadius: 9,
+                    color: T.ink,
+                    fontSize: 13,
+                    fontWeight: 600,
+                    textAlign: "left",
+                    width: "100%",
+                  }}
+                >
+                  <span style={{ flex: 1 }}>{p.name}</span>
+                  <span
+                    className="mono"
+                    style={{
+                      fontSize: 10,
+                      padding: "2px 8px",
+                      borderRadius: 999,
+                      background: "#fbf3d6",
+                      color: T.accentDark,
+                      border: `1px solid ${T.accentDark}`,
+                      fontWeight: 700,
+                      flexShrink: 0,
+                    }}
+                  >
+                    {t === 1 ? "⇄ TEAM A" : t === 2 ? "⇄ TEAM B" : "⇄ 同コート"}
+                  </span>
+                </button>
+              );
+            };
             const sectionHead = (text) => (
               <div
                 className="mono"
@@ -4614,6 +4704,8 @@ function SwapPanel({ match, allPlayers, allMatches, swapTargetId, setSwapTargetI
             );
             return (
               <>
+                {sameCourtCandidates.length > 0 && sectionHead("このコート内で組み替え")}
+                {sameCourtCandidates.map(renderSameCourtBtn)}
                 {freeCandidates.length > 0 && sectionHead("待機中から選ぶ")}
                 {freeCandidates.map(renderBtn)}
                 {playingCandidates.length > 0 && sectionHead("他コートと入れ替え")}
@@ -4722,6 +4814,7 @@ function Admin({ ctx }) {
     editHistoryWinner,
     deleteHistoryMatch,
     swapPlayer,
+    swapWithinMatch,
     toggleResting,
     toggleSinglesMode,
     removePlayer,
@@ -5079,6 +5172,7 @@ function Admin({ ctx }) {
                         myPlayer={null}
                         isNew={newIds.has(m.id)}
                         onSwap={swapPlayer}
+                        onSwapWithin={swapWithinMatch}
                         allPlayers={players}
                         allMatches={matches}
                       />
