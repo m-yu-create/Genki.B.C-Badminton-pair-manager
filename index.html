@@ -283,6 +283,7 @@ function normalizeRoom(data) {
   merged.costInfo = merged.costInfo || defaultCostInfo();
   // costInfo の必須プロパティ補完
   merged.costInfo = { ...defaultCostInfo(), ...merged.costInfo };
+  merged.pendingRegen = !!merged.pendingRegen;
   return merged;
 }
 
@@ -1409,6 +1410,7 @@ function App() {
       waiting: ws,
       lastNewMatchIds: ms.map((m) => m.id),
       lastNewMatchAt: Date.now(),
+      pendingRegen: false,
     }));
     showToast("組み合わせを再生成しました");
   }
@@ -1426,7 +1428,45 @@ function App() {
       wins: (p.wins || 0) + (wIds.has(p.id) ? 1 : 0),
       losses: (p.losses || 0) + (lIds.has(p.id) ? 1 : 0),
     }));
-    // Generate next match for the freed court
+
+    const perMatch = d.singlesMode ? 2 : 4;
+    const restingSet = new Set(d.restingIds || []);
+    // まだ試合中(remaining)の人を除いた、今コートに出ていない人
+    const busy = new Set();
+    remaining.forEach((x) =>
+      [...x.team1, ...x.team2].forEach((p) => busy.add(p.id))
+    );
+    const freeNow = updP.filter(
+      (p) => !busy.has(p.id) && !restingSet.has(p.id)
+    );
+    // 今すぐ組んだら待機に回る人数(余り)
+    const leftoverNow = freeNow.length % perMatch;
+    // まだ試合中のコートが残っているか
+    const otherCourtsRunning = remaining.length > 0;
+
+    // 「余りが1人以下」かつ「まだ別コートが試合中」のときは、
+    // すぐ組まずに全コート終了を待つ(同じメンバーで組み直すのを防ぐ)
+    const shouldWait =
+      otherCourtsRunning &&
+      freeNow.length >= perMatch && // そもそも組める人数はいる
+      leftoverNow < 2;
+
+    if (shouldWait) {
+      // このコートは「待機(次の組み合わせ待ち)」として残す
+      upd(() => ({
+        ...d,
+        players: updP,
+        matches: remaining, // 終わったコートは空にする
+        history: newHistory,
+        waiting: freeNow, // 空いた人は待機表示
+        // 全コート終了待ちフラグ
+        pendingRegen: true,
+      }));
+      showToast("結果を記録 · 全コート終了後に組み直します");
+      return;
+    }
+
+    // 通常: 空いたコートに次の試合を生成
     const { matches: addMatches, waiting: newWaiting } = buildMatches(
       updP,
       d.courts,
@@ -1444,6 +1484,7 @@ function App() {
       waiting: newWaiting,
       lastNewMatchIds: newIds,
       lastNewMatchAt: newIds.length > 0 ? Date.now() : d.lastNewMatchAt,
+      pendingRegen: false,
     }));
     if (newIds.length > 0) {
       showToast(`結果を記録 · ${addMatches.length}試合を新しく生成`);
@@ -3628,6 +3669,48 @@ function JoinSelect({ ctx }) {
 // AnnounceButton — 🔊試合の組み合わせを読み上げ
 // 端末が音声合成に非対応なら何も表示しない(エラーにしない)
 // ═══════════════════════════════════════════════════════════
+// 次の組み合わせ待ちのコートを表すグレーカード
+function PendingCourtCard({ court }) {
+  return (
+    <div
+      style={{
+        background: "#eef0ec",
+        border: `1px dashed #c7ccc4`,
+        borderRadius: 16,
+        padding: "20px 18px",
+        marginBottom: 12,
+        opacity: 0.85,
+        display: "flex",
+        alignItems: "center",
+        gap: 12,
+      }}
+    >
+      <span
+        className="mono"
+        style={{
+          background: "#c7ccc4",
+          color: "#fff",
+          fontSize: 11,
+          fontWeight: 700,
+          padding: "4px 9px",
+          borderRadius: 6,
+          flexShrink: 0,
+        }}
+      >
+        {court ? `COURT ${court}` : "COURT"}
+      </span>
+      <div style={{ flex: 1 }}>
+        <div style={{ fontSize: 14, fontWeight: 700, color: T.inkSoft }}>
+          待機中
+        </div>
+        <div style={{ fontSize: 11, color: T.inkSoft, opacity: 0.8, marginTop: 2 }}>
+          もう一方のコート終了後に組み合わせます
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function AnnounceButton({ matches, restingPlayers, waitingPlayers, players }) {
   const supported = speechSupported();
   const { voices, ready } = useJapaneseVoices();
@@ -4061,6 +4144,10 @@ function Status({ ctx }) {
                   allMatches={matches}
                 />
               ))}
+            {d.pendingRegen &&
+              Array.from({ length: d.courts }, (_, i) => i + 1)
+                .filter((c) => !matches.some((m) => m.court === c))
+                .map((c) => <PendingCourtCard key={"pc" + c} court={c} />)}
           </Sec>
         )}
 
@@ -5506,6 +5593,10 @@ function Admin({ ctx }) {
                         allMatches={matches}
                       />
                     ))}
+                  {d.pendingRegen &&
+                    Array.from({ length: d.courts }, (_, i) => i + 1)
+                      .filter((c) => !matches.some((m) => m.court === c))
+                      .map((c) => <PendingCourtCard key={"pc" + c} court={c} />)}
                   </>
               )}
               {waiting.length > 0 && (
