@@ -50,6 +50,7 @@
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useRef } = React;
 
+
 // ═══════════════════════════════════════════════════════════
 // Storage layer — Firebase Realtime Database (SDK + onValue)
 // 初回1回だけ取得し、以降は変更があった時だけプッシュで受信
@@ -824,6 +825,7 @@ function App() {
   const [undoCount, setUndoCount] = useState(0); // 再レンダリング用
 
   // Firebase リアルタイム購読: 初回データ取得 + 変更を自動受信
+  const [loadError, setLoadError] = useState(null);
   useEffect(() => {
     const unsubscribe = subscribeRoom(
       (remote) => {
@@ -834,10 +836,15 @@ function App() {
           setD(remote);
         }
         setOnline(true);
+        setLoadError(null);
         if (!loaded) setLoaded(true);
       },
-      () => {
+      (err) => {
         setOnline(false);
+        // 読み込みが失敗してもローディング画面で固まらないようにする
+        // (権限エラー・通信エラーなどでも必ず先に進める)
+        setLoadError(err);
+        if (!loaded) setLoaded(true);
       }
     );
     return unsubscribe;
@@ -2044,6 +2051,65 @@ function App() {
             }}
           />
           <div style={{ color: T.inkSoft, fontSize: 13 }}>読み込み中...</div>
+        </div>
+      </div>
+    );
+  }
+
+  // データの読み込みに失敗した場合(権限エラー・通信エラーなど)
+  // ローディングで固まらず、わかりやすいエラー画面を出す
+  if (loadError && d.rev === 0 && (d.players || []).length === 0 && (d.savedSessions || []).length === 0) {
+    return (
+      <div
+        style={{
+          minHeight: "100vh",
+          background: T.bg,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          padding: 24,
+        }}
+      >
+        <div
+          style={{
+            maxWidth: 360,
+            textAlign: "center",
+            background: T.surface,
+            border: `1px solid ${T.line}`,
+            borderRadius: 16,
+            padding: "28px 24px",
+          }}
+        >
+          <div style={{ fontSize: 32, marginBottom: 10 }}>⚠️</div>
+          <div style={{ fontSize: 15, fontWeight: 700, color: T.ink, marginBottom: 8 }}>
+            データを読み込めませんでした
+          </div>
+          <div style={{ fontSize: 12, color: T.inkSoft, lineHeight: 1.6, marginBottom: 18 }}>
+            通信状態を確認するか、時間をおいて再読み込みしてください。
+            <br />
+            繰り返し表示される場合は、データベース側の設定確認が必要です。
+          </div>
+          <button
+            onClick={() => window.location.reload()}
+            style={{
+              width: "100%",
+              padding: "12px",
+              background: T.primary,
+              border: "none",
+              borderRadius: 10,
+              color: T.surface,
+              fontSize: 13,
+              fontWeight: 700,
+            }}
+          >
+            再読み込み
+          </button>
+          <div
+            className="mono"
+            style={{ fontSize: 9, color: T.inkSoft, opacity: 0.6, marginTop: 14 }}
+          >
+            {String((loadError && (loadError.code || loadError.message)) || "")}
+          </div>
         </div>
       </div>
     );
@@ -10795,8 +10861,6 @@ function IconShare({ size = 22 }) {
   );
 }
 
-
-// ── Render ──
 const root = ReactDOM.createRoot(document.getElementById("root"));
 root.render(<App />);
 
